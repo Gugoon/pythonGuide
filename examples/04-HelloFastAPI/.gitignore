@@ -1,0 +1,45 @@
+# 가상환경
+.venv/
+venv/
+env/
+
+# 바이트 코드 / 빌드 산출물
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 배포·패키징
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 테스트·캐시
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 환경 변수 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+
+# SQLite DB 파일 (이번 챕터에선 안 쓰지만 미리 제외)
+*.sqlite
+*.sqlite3
+*.db
+
+# 에디터 / OS
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# 로그
+*.log

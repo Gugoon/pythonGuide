@@ -1,0 +1,66 @@
+### Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+### 가상환경
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+### uv
+.uv/
+
+### 테스트 / 캐시
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+### 환경 변수 (비밀 포함)
+.env
+.env.development
+.env.testing
+.env.production
+.env.local
+
+### DB 파일
+*.sqlite
+*.sqlite-journal
+*.sqlite3
+*.db
+
+### Alembic 임시
+alembic/versions/__pycache__/
+
+### macOS
+.DS_Store
+
+### 에디터/툴체인
+.vscode/
+.idea/
+*.swp
+*.swo
+
+### Claude Code 로컬 설정
+.claude/
+
+### Node / PDF 생성 임시
+node_modules/
+package-lock.json

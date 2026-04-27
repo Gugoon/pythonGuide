@@ -1,0 +1,7 @@
+# 이 폴더에 alembic 마이그레이션 파일들이 생성됩니다.
+#
+# 첫 마이그레이션을 만들려면:
+#     uv run alembic revision --autogenerate -m "create todos table"
+#
+# 적용:
+#     uv run alembic upgrade head

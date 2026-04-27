@@ -1,0 +1,256 @@
+/* =====================================================================
+   FastAPI 한국어 가이드 — PDF 스타일
+   가시성·가독성·밀림 방지
+   ===================================================================== */
+
+@page {
+    size: A4;
+    margin: 22mm 18mm 22mm 18mm;
+}
+
+/* 본문 기본 */
+body {
+    font-family:
+        -apple-system,
+        "Apple SD Gothic Neo",
+        "Noto Sans KR",
+        "맑은 고딕",
+        "Malgun Gothic",
+        "Helvetica Neue",
+        Helvetica,
+        Arial,
+        sans-serif;
+    font-size: 10.5pt;
+    line-height: 1.65;
+    color: #222;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+}
+
+/* 제목: 단락 처음에서 절대 페이지 하단에 혼자 걸리지 않도록 */
+h1, h2, h3, h4, h5, h6 {
+    font-family:
+        -apple-system,
+        "Apple SD Gothic Neo",
+        "Noto Sans KR",
+        "맑은 고딕",
+        sans-serif;
+    color: #111;
+    font-weight: 700;
+    line-height: 1.35;
+    page-break-after: avoid;
+    break-after: avoid;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+
+h1 {
+    font-size: 22pt;
+    margin-top: 0;
+    margin-bottom: 14pt;
+    padding-bottom: 6pt;
+    border-bottom: 2px solid #333;
+    page-break-before: always;
+    break-before: page;
+}
+
+/* 표지(첫 번째 h1)는 페이지 브레이크 없이 시작 */
+body > h1:first-of-type {
+    page-break-before: avoid;
+    break-before: avoid;
+}
+
+h2 {
+    font-size: 16pt;
+    margin-top: 20pt;
+    margin-bottom: 10pt;
+    padding-bottom: 4pt;
+    border-bottom: 1px solid #ddd;
+}
+
+h3 { font-size: 13.5pt; margin-top: 16pt; margin-bottom: 8pt; }
+h4 { font-size: 12pt;   margin-top: 12pt; margin-bottom: 6pt; }
+
+/* 단락 */
+p {
+    margin: 0 0 9pt 0;
+    orphans: 3;
+    widows: 3;
+}
+
+/* 링크 */
+a {
+    color: #0b61a4;
+    text-decoration: none;
+    word-break: break-all;
+}
+a:hover { text-decoration: underline; }
+
+/* 강조 */
+strong { font-weight: 700; color: #111; }
+em     { font-style: italic; }
+
+/* 인라인 코드 */
+code {
+    font-family:
+        "Menlo",
+        "SF Mono",
+        "Monaco",
+        "Consolas",
+        "Liberation Mono",
+        monospace;
+    font-size: 0.88em;
+    background: #f3f4f6;
+    color: #c7254e;
+    padding: 1px 4px;
+    border-radius: 3px;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+/* 코드 블록 */
+pre {
+    font-family:
+        "Menlo",
+        "SF Mono",
+        "Monaco",
+        "Consolas",
+        "Liberation Mono",
+        monospace;
+    font-size: 9pt;
+    line-height: 1.45;
+    background: #f6f8fa;
+    color: #24292f;
+    border: 1px solid #e1e4e8;
+    border-radius: 6px;
+    padding: 10pt 12pt;
+    margin: 10pt 0;
+    white-space: pre-wrap;        /* 긴 줄 자동 줄바꿈 */
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    page-break-inside: auto;      /* 긴 코드 블록은 페이지 나눔 허용 */
+    break-inside: auto;
+    overflow-x: hidden;
+}
+
+pre code {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+    word-break: break-all;
+}
+
+/* 인용문(블록쿼트) */
+blockquote {
+    margin: 10pt 0;
+    padding: 8pt 12pt;
+    background: #fff8e1;
+    border-left: 4px solid #e0a72e;
+    color: #4a3b00;
+    border-radius: 0 4px 4px 0;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+
+blockquote p { margin: 0 0 6pt 0; }
+blockquote p:last-child { margin-bottom: 0; }
+
+/* 목록 */
+ul, ol {
+    margin: 6pt 0 9pt 0;
+    padding-left: 22pt;
+}
+li { margin-bottom: 3pt; }
+li > p { margin-bottom: 4pt; }
+
+/* 표: 밀림 방지 */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10pt 0;
+    font-size: 9.5pt;
+    table-layout: fixed;                 /* 열 폭 고정 */
+    page-break-inside: auto;
+    break-inside: auto;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+thead {
+    display: table-header-group;         /* 페이지 분할 시 헤더 반복 */
+}
+
+th, td {
+    border: 1px solid #d0d7de;
+    padding: 6pt 8pt;
+    text-align: left;
+    vertical-align: top;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+th {
+    background: #f2f4f7;
+    font-weight: 700;
+    color: #111;
+}
+
+tr:nth-child(even) td { background: #fafbfc; }
+
+/* 수평선 */
+hr {
+    border: 0;
+    border-top: 1px solid #d0d7de;
+    margin: 14pt 0;
+}
+
+/* 페이지 브레이크 div (원본 md에 포함된 <div style="page-break-after...">) */
+div[style*="page-break"] {
+    page-break-after: always;
+    break-after: page;
+    height: 0;
+}
+
+/* 이미지(만약 있다면) */
+img {
+    max-width: 100%;
+    height: auto;
+}
+
+/* 앵커 대상 (ch01~ch12) — 상단 여백 확보 */
+a[id^="ch"] {
+    display: block;
+    position: relative;
+    top: -10mm;
+    visibility: hidden;
+}
+
+/* 목차 영역: 각 항목 여백 넉넉히 */
+h1#목차 + ul,
+h1 + h2 + ul {
+    line-height: 1.9;
+}
+
+/* 표지 페이지 */
+body > h1:first-of-type {
+    border-bottom: none;
+    font-size: 26pt;
+    text-align: center;
+    margin-top: 6mm;
+    margin-bottom: 10pt;
+}
+
+body > h1:first-of-type + p {
+    text-align: center;
+    font-size: 12pt;
+    color: #555;
+    margin-bottom: 14pt;
+}
+
+/* 표지 내 세부 섹션 여백 축소 */
+body > h1:first-of-type ~ h2 {
+    margin-top: 12pt;
+    font-size: 15pt;
+}

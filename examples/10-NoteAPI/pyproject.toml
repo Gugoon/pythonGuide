@@ -1,0 +1,41 @@
+[project]
+name = "note-api"
+version = "0.1.0"
+description = "FastAPI 가이드 10장 — 종합 예제 1: Note API (회원가입·로그인·메모 CRUD + PostgreSQL)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "gunicorn>=22.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    "aiosqlite>=0.20",
+    "pydantic[email]>=2.7",
+    "pydantic-settings>=2.4",
+    "pyjwt>=2.8",
+    "bcrypt>=4.0",
+    "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+# 같은 dev 묶음을 PEP 621 옵션 의존성으로도 노출.
+# `uv add --dev` 흐름은 위의 dependency-groups를 쓰고,
+# 일반 `pip install -e ".[dev]"` 흐름은 아래 optional-dependencies를 본다.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

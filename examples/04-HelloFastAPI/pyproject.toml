@@ -1,0 +1,10 @@
+[project]
+name = "hello-fastapi"
+version = "0.1.0"
+description = "FastAPI 가이드 04장 — 첫 프로젝트 예제"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]

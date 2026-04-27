@@ -1,0 +1,60 @@
+# 이 docker-compose.yml은 두 가지 용도로 쓰입니다.
+#
+# 1) 개발용 PostgreSQL만 띄우기 — `docker compose up -d db`
+#    호스트(=내 노트북)의 5432 포트로 PG가 노출되고, .env의 DATABASE_URL에
+#    `localhost:5432`로 적은 우리 앱이 그대로 붙습니다.
+#
+# 2) 앱+PG를 통째로 컨테이너로 — `docker compose up --build`
+#    이 경우 app 컨테이너는 db 컨테이너를 같은 네트워크 안에서 바라봅니다.
+#    `DATABASE_URL`의 호스트 자리는 `localhost`가 아니라 `db`(서비스 이름)가 됩니다.
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: note-api-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: note_api
+      POSTGRES_USER: note_user
+      POSTGRES_PASSWORD: note_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready로 "연결 가능 상태"인지 짧게 확인한다.
+      # 이 헬스체크가 healthy가 되어야 app 컨테이너가 시작된다.
+      test: ["CMD-SHELL", "pg_isready -U note_user -d note_api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: note-api-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 컨테이너 내부에서는 db 서비스 이름이 곧 호스트가 된다.
+      DATABASE_URL: postgresql+asyncpg://note_user:note_pass@db:5432/note_api
+      # 운영에서는 반드시 강한 난수로 교체. .env에서 받아 와도 됨.
+      SECRET_KEY: ${SECRET_KEY:-please-change-this}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+      CORS_ALLOW_ORIGINS: "*"
+    ports:
+      - "8000:8000"
+    # 컨테이너가 처음 떴을 때 마이그레이션을 한 번 적용한 뒤 서버를 띄운다.
+    # 운영에서는 마이그레이션을 별도 단계로 분리하는 것을 권장.
+    command: >
+      sh -c "alembic upgrade head && \
+             gunicorn app.main:app \
+               -k uvicorn.workers.UvicornWorker \
+               -w 4 \
+               -b 0.0.0.0:8000 \
+               --access-logfile - --error-logfile -"
+
+volumes:
+  postgres-data:

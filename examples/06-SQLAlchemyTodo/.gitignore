@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+# uv.lock 은 커밋합니다(잠금 파일은 협업에 필요)
+
+# 환경 변수
+.env
+.env.local
+.env.*.local
+
+# SQLite DB 파일 — 개발용이라 커밋하지 않음
+*.sqlite
+*.sqlite3
+*.db
+todo.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 테스트/캐시
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml

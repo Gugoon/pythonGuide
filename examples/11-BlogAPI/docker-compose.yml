@@ -1,0 +1,63 @@
+# 11-BlogAPI 개발용 docker-compose.
+# - db: MySQL 8.4 LTS 컨테이너. 호스트 3306 포트에 연결한다.
+# - app: 우리 FastAPI 앱. db가 헬스체크를 통과한 뒤 시작된다.
+# - migrate: 1회성 Alembic upgrade head 컨테이너. db가 살아 있을 때만 도는 단발성.
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: blog_api
+      MYSQL_USER: blog_user
+      MYSQL_PASSWORD: blog_pass
+      MYSQL_ROOT_PASSWORD: root_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-proot_pass"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "mysql+asyncmy://blog_user:blog_pass@db:3306/blog_api"
+      SECRET_KEY: "${SECRET_KEY:-dev-only-change-me}"
+    command: ["alembic", "upgrade", "head"]
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "mysql+asyncmy://blog_user:blog_pass@db:3306/blog_api"
+      SECRET_KEY: "${SECRET_KEY:-dev-only-change-me}"
+      ALGORITHM: "HS256"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+    ports:
+      - "8000:8000"
+    # 개발 중에는 uvicorn --reload 로 덮어 쓴다.
+    # 운영에서는 Dockerfile의 기본 CMD(gunicorn) 그대로 둔다.
+    command:
+      - "uvicorn"
+      - "app.main:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--reload"
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+
+volumes:
+  mysql-data:
