@@ -5,8 +5,8 @@
 # ───────────── 1) 빌더 ─────────────
 FROM python:3.13-slim AS builder
 
-# uv 설치(고정 버전을 박아두면 재현성이 좋아짐)
-COPY --from=ghcr.io/astral-sh/uv:0.4.30 /uv /uvx /usr/local/bin/
+# uv 설치(고정 버전을 박아두면 재현성이 좋아짐 — 새 마이너 나오면 직접 갱신)
+COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/
 
 # uv가 가상환경 대신 시스템 site-packages에 직접 깔도록 둔다.
 # (컨테이너 안에서는 격리가 이미 충분하므로 .venv를 따로 만들 이유가 없다.)
@@ -49,6 +49,10 @@ COPY --from=builder /usr/local/lib/python3.13 /usr/local/lib/python3.13
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /app /app
 
+# /app 을 sys.path 에 명시적으로 더한다 — `gunicorn`/`uvicorn`/`alembic` 등
+# console_script 가 우리 패키지를 import 할 수 있도록.
+ENV PYTHONPATH=/app
+
 # 앱 폴더 소유자를 app으로
 RUN chown -R app:app /app
 
@@ -56,11 +60,9 @@ USER app
 
 EXPOSE 8000
 
-# 운영용 기본 실행 — Gunicorn으로 Uvicorn 워커 4개를 띄운다.
+# 운영용 기본 실행 — Uvicorn 자체 멀티워커 + proxy-headers.
 # 개발 시에는 docker-compose에서 command를 uvicorn --reload로 덮어쓴다.
-CMD ["gunicorn", "app.main:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "4", \
-     "-b", "0.0.0.0:8000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-"]
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "4", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]

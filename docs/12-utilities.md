@@ -249,9 +249,9 @@ python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]   # Pydantic 모델을 더 정확히 인식
 
-[[tool.mypy.overrides]]
-module = ["fastapi.*", "starlette.*"]
-ignore_missing_imports = false
+# 타입 스텁이 부실한 라이브러리가 있으면 한 모듈에 한해 막아 둡니다.
+# 예: ignore_missing_imports = true 로 import 누락만 무시.
+# (fastapi/starlette 는 스텁이 잘 갖춰져 있어 별도 override 불필요.)
 ```
 
 명령:
@@ -567,7 +567,8 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
-    password_hash: Mapped[str] = mapped_column(String(60))
+    # bcrypt 해시는 60자지만 알고리즘 교체(예: Argon2)나 prefix 변동을 대비해 여유를 둡니다.
+    password_hash: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
     posts: Mapped[list["Post"]] = relationship(back_populates="author")
@@ -679,23 +680,37 @@ uv run alembic history
 
 ### env.py 비동기 설정 핵심
 
-`alembic/env.py`에서 비동기 엔진을 쓰려면:
+`alembic/env.py`에서 비동기 엔진을 쓰려면 **`do_run_migrations` 함수 정의가 반드시 있어야** 합니다(아래 예시 참고). 이 함수가 동기 connection 위에서 실제 마이그레이션을 실행합니다.
 
 ```python
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        render_as_batch=True,   # SQLite ALTER TABLE 호환
+    )
+    with context.begin_transaction():
+        context.run_migrations()
 
 def run_migrations_online():
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section),
+        config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
     )
     async def do_run():
         async with connectable.connect() as conn:
             await conn.run_sync(do_run_migrations)
+        await connectable.dispose()
     asyncio.run(do_run())
 ```
 
-자세한 템플릿은 06장과 10장 종합 예제에서 다뤘습니다.
+자세한 템플릿은 06장과 10장 종합 예제에서 다뤘습니다(전체 self-contained 코드는 거기에 있음).
 
 ### 함정
 
@@ -806,7 +821,11 @@ token = jwt.encode(payload, SECRET, algorithm=ALGO)
 
 # 검증
 try:
-    decoded = jwt.decode(token, SECRET, algorithms=[ALGO])
+    decoded = jwt.decode(
+        token, SECRET, algorithms=[ALGO],
+        options={"require": ["exp", "sub", "iat"]},   # 필수 클레임 강제
+    )
+    # JWT 표준상 sub 는 문자열입니다. 정수가 필요하면 디코딩 후 캐스트.
     user_id = int(decoded["sub"])
 except jwt.ExpiredSignatureError:
     print("만료됨")
@@ -1442,10 +1461,11 @@ async def test_fetch():
 
 ```python
 import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from app.main import app
 
-@pytest.fixture
+@pytest_asyncio.fixture     # ← 비동기 fixture 는 이 데코레이터를 써야 합니다
 async def client():
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -1457,6 +1477,8 @@ async def test_root(client):
     r = await client.get("/")
     assert r.status_code == 200
 ```
+
+> `@pytest.fixture` + `async def` 조합은 그대로는 동작하지 않습니다(pytest 자체는 async generator 를 안 풀어 줍니다). `@pytest_asyncio.fixture` 를 쓰거나, 12.30 의 `asyncio_mode = "auto"` 모드를 켜고 함께 사용하세요.
 
 ### 자주 쓰는 패턴: DB 의존성 오버라이드
 
@@ -2312,47 +2334,59 @@ uv run fastapi run app/main.py
 
 ### 함정
 
-- 운영 환경에서는 `gunicorn -k uvicorn.workers.UvicornWorker`처럼 워커를 여러 개 띄우는 게 일반적입니다(12.55 참고).
+- 운영 환경에서는 워커를 여러 개 띄웁니다 — 이 가이드의 표준은 **Uvicorn 자체 멀티워커**(`uvicorn ... --workers N --proxy-headers`) 입니다(09 배포 가이드 참고). `gunicorn -k uvicorn.workers.UvicornWorker` 패턴은 deprecated 되어 별도 패키지(`uvicorn-worker`)로 분리되었습니다.
 
 ---
 
 ## O. 운영 라이브러리
 
-## 12.55 Gunicorn (UvicornWorker)
+## 12.55 Uvicorn 멀티워커 / Gunicorn (선택)
 
-> **한 줄**: Uvicorn 워커를 여러 프로세스로 띄워 부하를 분산하는 운영용 프로세스 매니저.
-> **버전 (2026-04 기준)**: 23.x
-> **설치**: `uv add gunicorn`
-> **공식**: https://gunicorn.org/
+> **한 줄**: 비동기 FastAPI 앱은 **Uvicorn 자체 멀티워커**(0.30+ 내장)가 표준. Gunicorn 의 운영 기능(graceful reload, preload)이 필요하면 별도 패키지 `uvicorn-worker` 로 분리해 사용.
+> **버전 (2026-04 기준)**: Uvicorn 0.30+, Gunicorn 23.x, uvicorn-worker (PyPI 별도 패키지)
+> **설치**: 표준 — `uv add "uvicorn[standard]>=0.30"`. Gunicorn 경로를 쓰려면 `uv add "gunicorn>=23" uvicorn-worker`.
+> **공식**: https://www.uvicorn.org/ , https://gunicorn.org/
 
-### 왜 쓰는가
+### 왜 멀티워커?
 
-Uvicorn 한 프로세스로는 단일 CPU만 활용합니다. Gunicorn으로 여러 프로세스를 띄우면 GIL 한계를 우회해 멀티코어를 사용합니다.
+Uvicorn 한 프로세스로는 단일 CPU만 활용합니다. 워커를 여러 개 띄우면 GIL 한계를 우회해 멀티코어를 사용합니다. 비동기 앱에서는 한 워커 안에서도 동시 처리량이 크므로 **워커 수 = CPU 코어 수** 정도가 출발점입니다(`(2 * CPU) + 1` 공식은 동기 WSGI 시절 가이드).
 
-### 명령
+### 표준: Uvicorn 한 줄
+
+```bash
+uv run uvicorn app.main:app \
+    --host 0.0.0.0 --port 8000 \
+    --workers 4 \
+    --proxy-headers --forwarded-allow-ips='*'
+```
+
+- `--workers 4`: 워커 4개. 비동기 앱은 보통 CPU 코어 수 정도가 시작점.
+- `--proxy-headers --forwarded-allow-ips`: nginx/리버스 프록시 뒤에서 `X-Forwarded-Proto`/`X-Forwarded-For` 신뢰. 없으면 scheme/IP 가 잘못 잡힙니다.
+
+### Gunicorn 을 쓰고 싶다면 (선택)
+
+`uv add uvicorn-worker` 후:
 
 ```bash
 uv run gunicorn app.main:app \
-    -k uvicorn.workers.UvicornWorker \
-    -w 4 \
-    -b 0.0.0.0:8000 \
-    --access-logfile - \
-    --error-logfile -
+    -k uvicorn_worker.UvicornWorker \
+    -w 4 -b 0.0.0.0:8000 \
+    --timeout 60 \
+    --forwarded-allow-ips='127.0.0.1' \
+    --access-logfile - --error-logfile -
 ```
 
-- `-k`: 워커 클래스. UvicornWorker가 ASGI 앱을 처리.
-- `-w 4`: 워커 4개. 보통 `(2 * CPU 코어) + 1`이 출발점.
-- `-b`: 바인드 주소.
-- `--access-logfile -`: 표준 출력으로 액세스 로그 (Docker 친화적).
+> **주의**: 옛 `gunicorn -k uvicorn.workers.UvicornWorker` 는 Uvicorn 0.30 부터 deprecated, 0.31 에서 별도 패키지(`uvicorn-worker`)로 분리되었습니다. 위처럼 `uvicorn_worker.UvicornWorker` 를 쓰세요.
 
 ### 자주 쓰는 패턴: 컨테이너화
 
-Dockerfile에서:
+Dockerfile 의 CMD 한 줄:
 
 ```dockerfile
-CMD ["gunicorn", "app.main:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "4", "-b", "0.0.0.0:8000"]
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "4", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]
 ```
 
 ### 함정

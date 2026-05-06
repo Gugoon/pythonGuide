@@ -31,7 +31,6 @@ class Base(DeclarativeBase):
 engine: AsyncEngine = create_async_engine(
     settings.database_url,
     echo=False,
-    future=True,
 )
 
 # 세션 팩토리. 매 요청마다 이 팩토리에서 세션 하나를 꺼내 씁니다.

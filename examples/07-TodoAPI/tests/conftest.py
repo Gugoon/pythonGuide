@@ -30,7 +30,7 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 @pytest_asyncio.fixture
 async def engine():
     """테스트용 비동기 엔진. 매 테스트마다 새로 만든다."""
-    engine = create_async_engine(TEST_DATABASE_URL, future=True)
+    engine = create_async_engine(TEST_DATABASE_URL)
 
     # 테이블을 만든다. 운영에서는 alembic 이 하지만, 테스트는 빠르게 metadata.create_all 로 끝낸다.
     async with engine.begin() as conn:

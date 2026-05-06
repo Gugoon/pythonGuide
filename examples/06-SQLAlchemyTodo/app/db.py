@@ -35,8 +35,6 @@ engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
     # echo=True 로 두면 모든 SQL 문이 콘솔에 찍힌다(디버깅에 유용).
     echo=False,
-    # 2.0 스타일 사용 명시(2.0 에서는 사실 기본).
-    future=True,
 )
 
 

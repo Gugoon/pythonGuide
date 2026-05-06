@@ -1,7 +1,7 @@
 """FastAPI 앱 조립 — 미들웨어, 라우터 include, 헬스체크 한 줄.
 
-`uv run uvicorn app.main:app --reload` 또는
-`gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000`
+개발: `uv run uvicorn app.main:app --reload`
+운영: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers --forwarded-allow-ips='*'`
 어느 쪽으로도 띄울 수 있게 모듈 끝에서 `app`을 노출한다.
 """
 

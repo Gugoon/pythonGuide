@@ -5,7 +5,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String
+from sqlalchemy import Boolean, DateTime, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,8 +31,11 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # server_default 로 DB-side 기본값을 둬 raw SQL INSERT/마이그레이션에서도 안전.
+    # default(Python 측)는 ORM 경로에서 객체에 즉시 값이 박히도록 보조.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        server_default=func.now(),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )

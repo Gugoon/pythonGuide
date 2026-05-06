@@ -234,6 +234,13 @@ uv add --dev pytest pytest-asyncio httpx
 - `.venv/` — 가상환경 (이 폴더는 git에 올리지 않음)
 - `.python-version` — Python 3.13
 
+> **빈 `__init__.py` 들을 만들어 둡니다** — 10.1.5 트리에 표시된 `app/__init__.py`, `app/routers/__init__.py`, `tests/__init__.py` 세 개의 빈 파일을 지금 만들어 두세요. 본문이 한 단계씩 코드를 채워가는 동안 import 경로와 pytest 디스커버리가 안정적으로 동작합니다.
+>
+> ```bash
+> mkdir -p app/routers tests
+> touch app/__init__.py app/routers/__init__.py tests/__init__.py
+> ```
+
 ### 10.3.3 `.gitignore`와 `.env.example`
 
 `.gitignore`:
@@ -277,7 +284,8 @@ postgres-data/
 DATABASE_URL=postgresql+asyncpg://note_user:note_pass@localhost:5432/note_api
 
 # JWT 서명에 쓰는 비밀키 — 운영에서는 반드시 강한 난수로!
-SECRET_KEY=please-change-this
+# 32바이트 미만이면 PyJWT 가 InsecureKeyLengthWarning 을 띄웁니다.
+SECRET_KEY=please-change-this-to-32-bytes-or-longer-random-string
 
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=60
@@ -400,7 +408,9 @@ class Settings(BaseSettings):
     )
 
     # ── JWT ──────────────────────────────────────────
-    secret_key: str = "please-change-this"
+    # PyJWT 2.x 의 InsecureKeyLengthWarning(<32바이트) 회피용 32바이트 이상 더미.
+    # 운영에서는 .env로 반드시 강한 난수를 주입한다.
+    secret_key: str = "please-change-this-to-32-bytes-or-longer-random-string"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
@@ -793,7 +803,7 @@ uv run alembic revision --autogenerate -m "initial: create users and notes"
 
 `alembic/versions/` 아래에 `<해시>_initial_create_users_and_notes.py` 같은 파일이 한 개 생깁니다. 한 번 열어서 `op.create_table("users", ...)`와 `op.create_table("notes", ...)`가 들어 있는지 확인하세요.
 
-본 가이드의 예제 폴더는 보기 좋게 파일명을 **`0001_initial.py`**로 바꿔 두었습니다. 직접 따라하실 때도 이름을 바꾸셔도 됩니다(파일 안의 `revision = "..."` 식별자만 헷갈리지 않게).
+본 가이드의 예제 폴더는 보기 좋게 파일명을 **`0001_initial.py`**로 바꿔 두었습니다. 직접 따라하실 때 이름을 바꾸시려면 **파일을 열어 `revision = "..."` 변수도 함께 `0001_initial` 로 바꿔야** 본문의 출력 로그(`Running upgrade  -> 0001_initial, ...`)와 일치합니다(파일명만 바꾸면 hash 식별자가 그대로 남아 로그에 다른 식별자가 찍힙니다).
 
 > **autogenerate가 자동으로 만들어 준 파일은 항상 한 번 읽어보세요.** 100% 정확하지 않습니다. 인덱스 이름, 제약조건, 데이터 마이그레이션 같은 부분은 손으로 보강해야 할 때가 있습니다. 본 챕터처럼 단순한 표 두 개는 거의 항상 그대로 동작합니다.
 
@@ -1788,7 +1798,13 @@ async def signup_and_login(client, signup, login) -> str:
 
 ### 10.17.3 `tests/test_notes.py` (핵심 케이스)
 
-전체 코드는 예제 폴더에 있습니다. 여기서는 **본인 소유 검사** 테스트를 발췌해 봅니다.
+전체 코드는 예제 폴더에 있습니다. 여기서는 **본인 소유 검사** 테스트를 발췌해 봅니다. 발췌 코드의 `signup_and_login` 헬퍼는 같은 `tests/` 패키지의 `conftest.py` 에 정의되어 있으므로 파일 상단에 다음 한 줄 import 가 필요합니다(예제 파일에는 이미 들어 있습니다).
+
+```python
+from .conftest import signup_and_login   # ← tests/__init__.py 가 있어야 동작
+```
+
+이어지는 발췌:
 
 ```python
 async def test_other_users_note_returns_404(
@@ -1902,7 +1918,7 @@ tests/test_notes.py::test_patch_with_empty_body_keeps_original PASSED
 # ───────────── 1) 빌더 ─────────────
 FROM python:3.13-slim AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:0.4.30 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/
 
 ENV UV_SYSTEM_PYTHON=1 \
     UV_LINK_MODE=copy \
@@ -1927,7 +1943,8 @@ FROM python:3.13-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
 
 # 비루트 사용자 — 권한 사고를 줄인다.
 RUN groupadd --system app && \
@@ -1945,27 +1962,26 @@ USER app
 
 EXPOSE 8000
 
-CMD ["gunicorn", "app.main:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "4", \
-     "-b", "0.0.0.0:8000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-"]
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "4", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]
 ```
 
 각 부분을 풀어 봅니다.
 
 - **`FROM python:3.13-slim AS builder`** — 빌드 단계. slim은 Debian 베이스에서 일부 도구를 제외한 가벼운 이미지.
-- **`COPY --from=ghcr.io/astral-sh/uv:0.4.30 /uv /uvx /usr/local/bin/`** — uv 바이너리를 공식 이미지에서 가져옵니다. 버전을 박아두면 재현성이 좋아집니다.
+- **`COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/`** — uv 바이너리를 공식 이미지에서 가져옵니다. 버전을 박아두면 재현성이 좋아집니다(작성 시점 안정 태그; 새 마이너 출시 시 직접 갱신).
 - **`UV_SYSTEM_PYTHON=1`** — uv가 `.venv` 대신 컨테이너의 시스템 site-packages에 곧장 설치하도록. 컨테이너 안은 격리가 이미 충분해서 `.venv`를 또 만들 이유가 없습니다.
 - **의존성 메타데이터를 먼저 복사**(`pyproject.toml`, `uv.lock`)한 뒤 의존성을 설치하고, **그 다음에 앱 소스를 복사**합니다. 이 순서가 Docker의 레이어 캐시를 가장 잘 활용합니다 — 코드만 바뀌면 의존성 설치 단계는 캐시되어 다시 안 돌아갑니다.
 - **런타임 단계**는 더 깨끗합니다. uv도 빌드 결과물도 그대로 가져오지만 빌드 도구는 가져오지 않습니다.
+- **`ENV PYTHONPATH=/app`** — `--no-install-project` 로 빌드한 패키지 외에, 우리 `app/` 폴더가 cwd 기준 import 가능하도록 PATH 에 명시. console_script 가 cwd 를 자동으로 sys.path 에 안 넣는 환경(예: 일부 컨테이너 런타임)에서도 안전.
 - **`useradd ... app`** + **`USER app`** — 비루트 사용자를 만들고 그 사용자로 실행합니다. 컨테이너 안에서 root로 도는 프로세스는 컨테이너 탈출 취약점이 발견되면 호스트 root와 가까워지므로, 일반 사용자로 두는 게 표준입니다.
-- **`CMD ["gunicorn", ...]`** — 운영용 실행. **Gunicorn으로 Uvicorn 워커 4개**를 띄웁니다. 개발 시에는 docker-compose에서 명령을 덮어씁니다.
+- **`CMD ["uvicorn", ...]`** — 운영용 실행. **Uvicorn 자체 멀티워커 4개 + `--proxy-headers`** 로 띄웁니다. 개발 시에는 docker-compose에서 명령을 `uvicorn --reload` 로 덮어씁니다.
 
-> **왜 Gunicorn + Uvicorn 워커?** Uvicorn 단독으로는 한 프로세스로 동작합니다. 운영에서는 CPU 코어를 다 활용하기 위해 여러 워커를 띄우고, 워커 한 명이 죽으면 자동으로 재시작하는 매니저가 필요합니다. Gunicorn이 그 매니저 역할을 하고, 각 워커는 비동기 처리를 위해 `UvicornWorker` 클래스를 씁니다.
+> **왜 Uvicorn 자체 멀티워커?** Uvicorn 0.30(2024-06)부터 자체 워커 매니저가 내장되어, 따로 Gunicorn 을 두지 않아도 N 워커를 띄울 수 있습니다. 옛 패턴인 `gunicorn -k uvicorn.workers.UvicornWorker` 는 deprecated 되어 0.31 에서 별도 패키지(`uvicorn-worker`)로 분리됐습니다. 이 가이드는 단순한 Uvicorn 한 줄을 표준으로 씁니다(09장 배포 가이드 참고).
 
-> **워커 수는 어떻게 정하나?** 일반적인 권장은 `(2 × CPU 코어) + 1`입니다. 1코어 환경이면 3, 2코어면 5. 위 Dockerfile은 4로 박아두었지만, 실제 배포 시 CPU 환경에 맞춰 조정하세요.
+> **워커 수는 어떻게 정하나?** 비동기 앱은 한 워커로도 동시 처리량이 크므로 보통 **CPU 코어 수** 정도가 출발점입니다. 1코어 환경이면 1~2, 2코어면 2~4. 위 Dockerfile 은 4로 박아두었지만, 실제 배포 시 CPU 환경과 메모리 사용량을 보며 조정하세요.
 
 ### 10.18.3 `.dockerignore` (선택이지만 권장)
 
@@ -2034,7 +2050,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://note_user:note_pass@db:5432/note_api
-      SECRET_KEY: ${SECRET_KEY:-please-change-this}
+      SECRET_KEY: ${SECRET_KEY:-please-change-this-to-32-bytes-or-longer-random-string}
       ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: "60"
       CORS_ALLOW_ORIGINS: "*"
@@ -2042,11 +2058,10 @@ services:
       - "8000:8000"
     command: >
       sh -c "alembic upgrade head && \
-             gunicorn app.main:app \
-               -k uvicorn.workers.UvicornWorker \
-               -w 4 \
-               -b 0.0.0.0:8000 \
-               --access-logfile - --error-logfile -"
+             uvicorn app.main:app \
+               --host 0.0.0.0 --port 8000 \
+               --workers 4 \
+               --proxy-headers --forwarded-allow-ips='*'"
 
 volumes:
   postgres-data:
@@ -2058,7 +2073,9 @@ volumes:
 - **`depends_on: db: condition: service_healthy`** — db가 healthy가 된 뒤에야 app이 시작됩니다. `pg_isready`로 검증되므로 "DB가 아직 안 뜬 상태에서 마이그레이션이 실패하는" 사고를 막아 줍니다.
 - **`environment.DATABASE_URL`** — 호스트가 `localhost`가 아니라 **`db`(서비스 이름)** 입니다. 같은 docker network 안에서는 서비스 이름이 곧 호스트입니다.
 - **`environment.SECRET_KEY: ${SECRET_KEY:-...}`** — 셸의 `SECRET_KEY` 환경 변수가 있으면 그것을, 없으면 기본값을 쓴다는 뜻. 운영에서는 반드시 셸 또는 외부 비밀 관리자에서 주입.
-- **`command: sh -c "alembic upgrade head && gunicorn ..."`** — 컨테이너 시작 시 마이그레이션을 한 번 적용한 뒤 Gunicorn을 실행. 운영에서는 마이그레이션을 별도 단계로 분리하는 것이 일반적이지만, 학습용으로는 한 줄로 묶어 두면 편합니다.
+- **`command: sh -c "alembic upgrade head && uvicorn ..."`** — 컨테이너 시작 시 마이그레이션을 한 번 적용한 뒤 Uvicorn 멀티워커를 띄웁니다. 운영에서는 마이그레이션을 별도 단계로 분리하는 것이 일반적이지만, 학습용으로는 한 줄로 묶어 두면 편합니다.
+
+> **`restart: unless-stopped` + `alembic upgrade head` 조합 주의**: 마이그레이션이 실패하면 컨테이너가 비정상 종료되고, restart 정책에 따라 무한 재시작(crash loop)이 일어납니다. 부팅이 계속 실패하면 우선 `docker compose logs app` 으로 첫 실패 로그를 확인하고, 마이그레이션을 별도 일회성 컨테이너로 분리하는 패턴(09.5.4 패턴 B)으로 옮기는 것을 고려하세요.
 
 ### 10.19.1 통째로 띄우기
 
@@ -2080,12 +2097,13 @@ docker compose --env-file .env up --build
 ```
 note-api-db   | ... database system is ready to accept connections
 note-api-app  | INFO  [alembic.runtime.migration] Running upgrade  -> 0001_initial, ...
-note-api-app  | [INFO] Listening at: http://0.0.0.0:8000 (1)
-note-api-app  | [INFO] Using worker: uvicorn.workers.UvicornWorker
-note-api-app  | [INFO] Booting worker with pid: 8
-note-api-app  | [INFO] Booting worker with pid: 9
-note-api-app  | [INFO] Booting worker with pid: 10
-note-api-app  | [INFO] Booting worker with pid: 11
+note-api-app  | INFO:     Started parent process [1]
+note-api-app  | INFO:     Started server process [8]
+note-api-app  | INFO:     Started server process [9]
+note-api-app  | INFO:     Started server process [10]
+note-api-app  | INFO:     Started server process [11]
+note-api-app  | INFO:     Application startup complete.
+note-api-app  | INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
 
 이제 `http://localhost:8000/health`가 `{"status":"ok"}`를 돌려주면 성공입니다. 10.16의 curl 흐름을 그대로 다시 돌려보세요. 모두 동작합니다.
@@ -2157,7 +2175,7 @@ docker compose down -v
 ### 10.21.1 코드/설정 점검
 
 - [ ] **`.env`가 git에 커밋되지 않는지** — `git status`로 확인. `.gitignore`에 들어 있어야 정상.
-- [ ] **`SECRET_KEY`를 `please-change-this`로 두고 운영에 띄우지 않았는지** — `secrets.token_urlsafe(48)`로 만든 값으로.
+- [ ] **`SECRET_KEY`를 더미 값(`please-change-this-...`)으로 두고 운영에 띄우지 않았는지** — `secrets.token_urlsafe(48)`로 만든 값으로 교체.
 - [ ] **응답에 `hashed_password`가 새 나가지 않는지** — `UserRead` 스키마에 그 필드가 없어야 정상. `curl`로 한 번 직접 확인.
 - [ ] **로그인 실패 메시지가 통일되어 있는지** — "사용자 없음"과 "비번 틀림"이 같은 메시지여야 함.
 - [ ] **메모 라우트들이 본인 소유 검사를 거치는지** — `crud.get_owned_note(...)`나 `WHERE user_id == current_user.id`가 모든 핸들러에 있어야 함.
@@ -2181,7 +2199,7 @@ docker compose down -v
 
 ### 10.21.4 일반 운영
 
-- [ ] **운영에서는 `--reload` 플래그 사용 금지** — 파일 와처가 무겁고 불안정. Gunicorn + UvicornWorker만 사용.
+- [ ] **운영에서는 `--reload` 플래그 사용 금지** — 파일 와처가 무겁고 불안정. Uvicorn 멀티워커(`--workers N --proxy-headers`)만 사용.
 - [ ] **로그를 `stdout`으로** — `--access-logfile -`. 컨테이너 환경의 표준.
 - [ ] **헬스체크 엔드포인트** — `/health` 가 200을 돌려주는지 외부에서 한 번 확인.
 - [ ] **에러 응답에 민감 정보가 안 새는지** — `HTTPException(detail=...)`의 메시지가 사용자에게 노출됩니다. 내부 SQL 에러를 그대로 노출하지 않도록.

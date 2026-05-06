@@ -4,9 +4,16 @@
 코드에 박지 않도록 한 곳에 모았습니다.
 """
 
+from __future__ import annotations
+
+import os
+import warnings
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DUMMY_SECRET_PREFIX = "please-change"
 
 
 class Settings(BaseSettings):
@@ -35,6 +42,25 @@ class Settings(BaseSettings):
 
     # 액세스 토큰 만료 시간(분).
     access_token_expire_minutes: int = 60
+
+    @model_validator(mode="after")
+    def _check_secret_key(self) -> "Settings":
+        """더미 secret_key 가 운영에서 그대로 쓰이는 사고를 막는다.
+
+        `APP_ENV=production` 이면 더미 prefix 검출 시 즉시 부팅 실패.
+        그 외 환경(개발/테스트)에서는 경고만 띄운다.
+        """
+        if self.secret_key.startswith(DUMMY_SECRET_PREFIX):
+            if os.getenv("APP_ENV", "development").lower() == "production":
+                raise RuntimeError(
+                    "운영(APP_ENV=production)에서 기본 더미 SECRET_KEY가 감지되었습니다. "
+                    ".env에 32바이트 이상의 강한 난수를 주입하세요."
+                )
+            warnings.warn(
+                "기본 더미 SECRET_KEY가 사용 중입니다. 운영 배포 전 .env로 반드시 교체하세요.",
+                stacklevel=2,
+            )
+        return self
 
 
 @lru_cache

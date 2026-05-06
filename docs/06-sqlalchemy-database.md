@@ -312,6 +312,8 @@ SQLAlchemy 2.0의 비동기 API를 쓰려면 DB 종류에 맞는 **비동기 드
 
 > **왜 같은 DB에 동기/비동기 드라이버가 따로 있나요?** 비동기 함수는 안에서 진짜로 비동기로 동작해야 합니다. 옛날 동기 드라이버를 그대로 쓰면 "기다리는 동안 멈춰 있는" 동기 동작이 되어 비동기의 의미가 사라집니다. 그래서 `aiosqlite`/`asyncpg`/`asyncmy` 같은 비동기 전용 드라이버가 필요합니다.
 
+> **`greenlet` 의존성**: SQLAlchemy 의 async API 는 내부적으로 `greenlet` 라이브러리를 써서 동기/비동기 다리를 놓습니다. `sqlalchemy[asyncio]` extras 로 자동 설치되지만, Alpine 같은 일부 환경에서는 휠이 없어 빌드 도구가 필요할 수 있습니다(`apk add gcc musl-dev`). 컨테이너에서 알 수 없는 빌드 에러가 나면 가장 먼저 의심하세요.
+
 ---
 
 ## 6.5 SQLAlchemy 2.0의 새 표기법
@@ -336,7 +338,8 @@ class Todo(Base):
     title: Mapped[str] = mapped_column(String(200))
     is_done: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
+        server_default=func.now(),
         default=lambda: datetime.now(timezone.utc),
     )
 ```
@@ -498,7 +501,6 @@ class Base(DeclarativeBase):
 engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
     echo=False,           # True 로 두면 모든 SQL 문이 콘솔에 찍힌다(디버깅용)
-    future=True,
 )
 
 # 2) 세션 팩토리 — 요청마다 새 AsyncSession 을 만들어 주는 함수.
@@ -532,10 +534,9 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 - **`Base`**: 모든 모델 클래스의 부모. 06.5에서 본 그것입니다. ORM 모델들이 다 이걸 상속합니다.
 - **`create_async_engine(DATABASE_URL, ...)`**: 비동기 엔진을 만듭니다.
   - `echo=False`: SQL 로그를 안 찍습니다. 디버깅 시에만 `True`.
-  - `future=True`: 2.0 스타일을 사용한다는 명시(2.0에서는 사실 기본).
 - **`async_sessionmaker(bind=engine, ...)`**: "이 엔진에 연결된 세션을 만들어 주는 공장"입니다. 호출하면 새 `AsyncSession`을 반환합니다.
   - `expire_on_commit=False`: commit 후에도 ORM 객체의 속성에 접근할 수 있게 합니다(기본 `True`이면 commit 직후 객체가 "유효 기한 만료" 상태가 되어 다시 로드해야 함). FastAPI에서는 거의 항상 `False`로 둡니다.
-  - `autoflush=False`: 자동 flush를 끕니다(취향). 입문 단계에서는 이게 더 이해하기 쉽습니다.
+  - `autoflush=False`: 자동 flush를 끕니다(취향). 입문 단계에서는 이게 더 이해하기 쉽습니다. **주의**: 같은 세션에서 `session.add(x)` 직후 `select(...).where(...)` 로 `x` 를 못 찾는 경우가 생길 수 있습니다. 그런 흐름이 필요하면 `await session.flush()` 를 명시적으로 호출하세요.
 - **`get_session()`**: FastAPI의 **의존성 함수**입니다. `Depends(get_session)`으로 라우트가 받게 됩니다. 한 요청에 한 세션이 만들어지고, 끝나면 자동으로 commit·close 됩니다.
 
 > **`async with SessionLocal() as session:`이란?** 비동기 컨텍스트 매니저입니다. 블록을 벗어나면 자동으로 `await session.close()`가 호출됩니다. 우리는 명시적으로 close를 호출할 필요가 없습니다.
@@ -596,13 +597,16 @@ class Todo(Base):
     title: Mapped[str] = mapped_column(String(200))
     is_done: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
+        server_default=func.now(),
         default=lambda: datetime.now(timezone.utc),
     )
 
     def __repr__(self) -> str:
         return f"<Todo id={self.id} title={self.title!r} is_done={self.is_done}>"
 ```
+
+> **`server_default=func.now()` 가 왜 같이 있나요?** Python-side `default` 만 두면 ORM 경로(`session.add(...)` → INSERT)에서는 잘 동작하지만, raw SQL 로 INSERT 하거나 마이그레이션 스크립트에서 컬럼이 NOT NULL 일 때 NULL 위반이 날 수 있습니다. `server_default` 로 DB 측 기본값을 둬서 어느 경로로 들어와도 안전. `DateTime(timezone=True)` 는 PostgreSQL/MySQL 에서 timezone-aware 컬럼이 되어 `datetime.now(timezone.utc)` 와 일관됩니다.
 
 설명:
 
@@ -898,7 +902,7 @@ todo = result.scalars().one_or_none()
 
 `session.get(Model, pk)`는 캐시까지 활용하므로 **PK 조회는 항상 `get`을 우선 고려**하세요.
 
-### 6.9.5 UPDATE — 객체 속성 변경 + 자동 INSERT
+### 6.9.5 UPDATE — 객체 속성 변경 + 자동 UPDATE
 
 UPDATE 라우트의 핵심은 다음 패턴입니다.
 
@@ -1110,7 +1114,9 @@ sqlalchemy.url =
 from __future__ import annotations
 
 import asyncio
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import pool
@@ -1118,12 +1124,17 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # ─────────────────────────────────────────────────────────
-# 우리 앱의 모델과 DATABASE_URL 을 가져오기 위한 import
-# (alembic 폴더가 프로젝트 루트의 자식이므로, 같은 sys.path 에 있다고 가정)
+# 우리 앱(app/) 을 import 가능하게 하기 위한 sys.path 보정.
+# alembic/ 폴더가 프로젝트 루트의 자식이라는 전제.
+# 이 줄이 없으면 일부 실행 환경에서 `ModuleNotFoundError: app` 가 납니다.
 # ─────────────────────────────────────────────────────────
-from app.config import DATABASE_URL
-from app.db import Base
-from app import models  # noqa: F401  - Base.metadata 에 모델이 등록되도록 import
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config import DATABASE_URL  # noqa: E402
+from app.db import Base  # noqa: E402
+from app import models  # noqa: E402, F401  - Base.metadata 에 모델이 등록되도록 import
 
 # Alembic Config 객체
 config = context.config

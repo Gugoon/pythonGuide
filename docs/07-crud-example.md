@@ -132,12 +132,17 @@ cd 07-TodoAPI
 ### 7.4.2 uv 로 초기화하고 의존성 추가
 
 ```bash
-uv init --no-readme           # uv 가 만드는 hello.py 는 곧 지울 거라 README 만 안 만들어둔다
-rm -f hello.py main.py        # uv init 이 만든 샘플 스크립트 정리
+uv init --bare                # 샘플 코드 없이 pyproject.toml 만 만든다
+rm -f hello.py main.py        # 혹시 남아 있는 샘플 스크립트 정리
 
 uv add fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" alembic aiosqlite
 uv add pydantic-settings
 uv add --dev pytest pytest-asyncio httpx
+
+# 패키지 마커 빈 파일들을 만들어 둔다
+# (테스트 디스커버리·import 안정성을 위해 명시적으로 두는 것을 권장)
+mkdir -p app/routers tests
+touch app/__init__.py app/routers/__init__.py tests/__init__.py
 ```
 
 설치가 끝나면 폴더에 다음이 생긴다.
@@ -263,7 +268,6 @@ class Base(DeclarativeBase):
 engine: AsyncEngine = create_async_engine(
     settings.database_url,
     echo=False,
-    future=True,
 )
 
 SessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
@@ -807,20 +811,30 @@ sqlalchemy.url = sqlite+aiosqlite:///./todo.db
 1. **앱의 모델 메타데이터를 `target_metadata` 로 등록**.
 2. **비동기 엔진으로 마이그레이션을 돌릴 수 있게 `asyncio.run(...)`** 으로 감싸기.
 
-전체 코드는 예제 폴더(`alembic/env.py`)에 그대로 있고, 핵심 부분만 옮긴다.
+아래 코드를 그대로 `alembic/env.py` 에 붙여 넣어 self-contained 로 동작하게 만든다(예제 폴더의 `alembic/env.py` 와 동일).
 
 ```python
+# alembic/env.py
+from __future__ import annotations
+
 import asyncio
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.config import settings
-from app.db import Base
-from app import models  # noqa: F401  -- 모델 등록을 위해 필요
+# alembic/ 가 프로젝트 루트의 자식이라는 전제로 sys.path 보정.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config import settings  # noqa: E402
+from app.db import Base  # noqa: E402
+from app import models  # noqa: E402, F401  -- 모델 등록을 위해 필요
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)
@@ -829,6 +843,20 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """오프라인 모드 — 실제 DB 에 연결하지 않고 SQL 문만 출력."""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
@@ -842,7 +870,7 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_migrations_online() -> None:
+async def run_async_migrations() -> None:
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -853,11 +881,14 @@ async def run_migrations_online() -> None:
     await connectable.dispose()
 
 
+def run_migrations_online() -> None:
+    asyncio.run(run_async_migrations())
+
+
 if context.is_offline_mode():
-    # ... offline 분기 (예제 코드 참고)
-    ...
+    run_migrations_offline()
 else:
-    asyncio.run(run_migrations_online())
+    run_migrations_online()
 ```
 
 여기서 짚을 점:
@@ -948,7 +979,7 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 @pytest_asyncio.fixture
 async def engine():
-    engine = create_async_engine(TEST_DATABASE_URL, future=True)
+    engine = create_async_engine(TEST_DATABASE_URL)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine

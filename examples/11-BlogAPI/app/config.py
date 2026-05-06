@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     )
 
     # JWT 서명용 비밀키. 운영에서는 .env로 반드시 강한 난수를 주입합니다.
-    secret_key: str = "please-change-this"
+    # 기본값은 PyJWT 2.x의 InsecureKeyLengthWarning(<32바이트)을 피하기 위해
+    # 32바이트 이상으로 둔 더미 문자열입니다.
+    secret_key: str = "please-change-this-to-32-bytes-or-longer-random-string"
 
     # JWT 알고리즘 — 이 가이드는 단일 서버 가정 → HS256 고정.
     algorithm: str = "HS256"

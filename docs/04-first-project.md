@@ -319,7 +319,6 @@ httptools         0.6.x
 idna              3.x
 pydantic          2.x.x
 pydantic_core     2.x.x
-python-dotenv     1.x.x
 sniffio           1.3.x
 starlette         0.x.x
 typing_extensions 4.x.x

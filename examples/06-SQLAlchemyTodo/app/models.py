@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -28,12 +28,12 @@ class Todo(Base):
     # 완료 여부 — 기본값 False(미완료).
     is_done: Mapped[bool] = mapped_column(default=False)
 
-    # 생성 시각 — 행이 만들어질 때 lambda 가 호출되어 현재 UTC 시각이 채워진다.
-    # Python 3.12+ 에서 datetime.utcnow() 는 deprecated 이므로
-    # 명시적 timezone.utc 를 붙인 datetime.now(timezone.utc) 를 쓴다.
-    # default 에는 함수 객체(여기서는 lambda)를 넘긴다 — 호출하면 모듈 import 시각이 박힘.
+    # 생성 시각 — DB-side `func.now()` 를 server_default 로 두어 raw SQL INSERT 시에도
+    # 자동 채움. timezone=True 로 PostgreSQL/MySQL 에서도 timezone-aware 로 일관 동작.
+    # Python-side default(lambda) 는 보조 — ORM 경로에서 즉시 값이 객체에 박히도록.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
+        server_default=func.now(),
         default=lambda: datetime.now(timezone.utc),
     )
 

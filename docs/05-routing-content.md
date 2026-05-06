@@ -596,7 +596,7 @@ def get_user(user_id: int):
 
 ### 5.7.1 `status_code=...`
 
-기본 응답 상태 코드를 200(또는 응답 본문이 없으면 204)이 아닌 다른 값으로 두려면 다음과 같이 적습니다.
+FastAPI 라우트의 기본 응답 상태 코드는 **항상 `200 OK`** 입니다(본문이 없다고 자동으로 204로 바뀌지 않습니다 — 본문 없는 응답을 의도하면 `status_code=204`를 명시해야 합니다). 기본값을 다른 값으로 바꾸려면 다음과 같이 적습니다.
 
 ```python
 from fastapi import status
@@ -982,9 +982,11 @@ def upload(file: UploadFile = File(...)):
     return {
         "filename": file.filename,
         "content_type": file.content_type,
-        "size": len(file.file.read()),
+        "size": file.size,
     }
 ```
+
+> **`file.file.read()` 를 직접 부르지 마세요**: 동기 read 라 이벤트 루프를 잠깐 막고, 한 번 읽으면 내부 커서가 끝으로 가서 이후 저장 시 빈 파일이 됩니다. 크기는 Starlette 0.30+ 의 `file.size` 를 쓰고, 내용을 읽어야 한다면 `await file.read()` (async 라우트) 또는 `file.file.seek(0)` 후 처리하세요.
 
 여러 파일을 한 번에 받을 수도 있습니다.
 
@@ -1185,7 +1187,7 @@ def get_me():
     ...
 ```
 
-이 코드는 `GET /users/me`가 들어왔을 때 **앞쪽 `{user_id}`에 매칭되려 시도하다가** "me는 정수가 아니다"로 422를 돌려보낼 수 있습니다. 항상 **더 구체적인 라우트(`/users/me`)를 위에** 두세요.
+이 코드는 `GET /users/me`가 들어왔을 때 **앞쪽 `{user_id}: int` 에 매칭이 시도되어** "me는 정수가 아니다"로 422를 돌려보냅니다(`user_id: str` 으로 선언했다면 그대로 매칭되어 의도와 다른 라우트가 호출됩니다). 항상 **더 구체적인 라우트(`/users/me`)를 위에** 두세요.
 
 ```python
 @app.get("/users/me")
@@ -1694,7 +1696,7 @@ uv add "uvicorn[standard]"
 ### 5.19.10 라우트가 `404`인데 분명 만든 것 같음
 
 - 데코레이터의 경로 문자열에 오타(`/qoutes/`)가 있는지
-- 마지막 슬래시 — `/quotes`와 `/quotes/`가 다르게 동작할 수 있음. `APIRouter(prefix="/quotes")` + `@router.get("/")` 조합은 **`/quotes/`** 가 됩니다(슬래시 끝). `/quotes`(슬래시 없음)에 GET을 보내면 FastAPI가 자동으로 307 redirect를 시도하거나 404를 줄 수 있어요.
+- 마지막 슬래시 — `/quotes`와 `/quotes/`가 다르게 동작할 수 있음. `APIRouter(prefix="/quotes")` + `@router.get("/")` 조합은 **`/quotes/`** 가 됩니다(슬래시 끝). 기본 설정(`redirect_slashes=True`)에서는 `/quotes`(슬래시 없음)에 GET을 보내면 **307 Temporary Redirect** 로 자동 리다이렉트되어 결국 같은 결과가 나옵니다. `app = FastAPI(redirect_slashes=False)` 로 끄면 그대로 `404`. (POST 의 경우 307 리다이렉트 시 본문이 손실될 수 있으니 클라이언트 쪽에서 정확한 슬래시 정책을 지키는 편이 안전합니다.)
 
 > **슬래시 끝 정책**: 본 가이드의 컨벤션은 라우터의 root는 `"/"`(끝 슬래시 있음), 단건 엔드포인트는 `"/{id}"`(끝 슬래시 없음)입니다. 클라이언트는 정확히 그 모양으로 호출합니다.
 

@@ -193,9 +193,9 @@ uv init
 ### 11.3.3 의존성 설치
 
 ```bash
-uv add fastapi "uvicorn[standard]" gunicorn \
-       sqlalchemy alembic asyncmy aiosqlite \
-       pyjwt bcrypt python-slugify \
+uv add fastapi "uvicorn[standard]" "gunicorn>=23" \
+       "sqlalchemy[asyncio]>=2.0" alembic asyncmy aiosqlite \
+       pyjwt bcrypt python-slugify python-multipart \
        pydantic-settings "pydantic[email]"
 
 uv add --dev pytest pytest-asyncio httpx
@@ -203,11 +203,12 @@ uv add --dev pytest pytest-asyncio httpx
 
 각 라이브러리의 역할:
 
-- **fastapi / uvicorn / gunicorn** — 웹 프레임워크와 ASGI 서버, 운영용 프로세스 매니저.
-- **sqlalchemy / alembic / asyncmy** — ORM, 마이그레이션, MySQL 비동기 드라이버.
+- **fastapi / uvicorn / gunicorn** — 웹 프레임워크와 ASGI 서버, 운영용 프로세스 매니저(선택). 본 가이드의 표준은 Uvicorn 자체 멀티워커이며 Gunicorn 은 graceful reload 가 필요할 때만 추가.
+- **sqlalchemy[asyncio] / alembic / asyncmy** — ORM(asyncio extras 포함), 마이그레이션, MySQL 비동기 드라이버.
 - **aiosqlite** — 테스트에서 인메모리 SQLite를 띄울 때 사용. 운영 코드는 MySQL.
 - **pyjwt / bcrypt** — 08장에서 깐 그대로. JWT 발급·검증, 비밀번호 해싱.
 - **python-slugify** — `"FastAPI 시작하기"` 같은 제목을 `"fastapi"` 같은 URL-safe 문자열로 바꿔 줍니다(11.7에서 사용).
+- **python-multipart** — `OAuth2PasswordRequestForm`(`/auth/login` 의 폼 파싱)에 필수. 없으면 부팅 즉시 *Form data requires "python-multipart" to be installed* 로 실패합니다.
 - **pydantic-settings / pydantic[email]** — `.env` 로딩과 이메일 형식 검증.
 
 > **왜 운영 DB와 다른 SQLite도 같이 깔아 두나요?** 통합 테스트를 빠르게 돌리기 위해서입니다. 11.17의 `tests/conftest.py`는 매 테스트마다 인메모리 SQLite DB를 새로 만들어 격리합니다. 같은 ORM 코드가 두 DB에서 모두 동작한다는 점은 SQLAlchemy의 큰 장점입니다.
@@ -321,7 +322,8 @@ mysql> exit
 ```bash
 # .env.example
 DATABASE_URL=mysql+asyncmy://blog_user:blog_pass@127.0.0.1:3306/blog_api
-SECRET_KEY=please-change-this
+# 32바이트 미만이면 PyJWT가 InsecureKeyLengthWarning 을 띄웁니다.
+SECRET_KEY=please-change-this-to-32-bytes-or-longer-random-string
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=60
 ```
@@ -357,7 +359,9 @@ class Settings(BaseSettings):
     database_url: str = (
         "mysql+asyncmy://blog_user:blog_pass@127.0.0.1:3306/blog_api"
     )
-    secret_key: str = "please-change-this"
+    # 기본값은 PyJWT 2.x 의 InsecureKeyLengthWarning(<32바이트) 회피용 더미.
+    # 운영에서는 .env로 반드시 강한 난수를 주입.
+    secret_key: str = "please-change-this-to-32-bytes-or-longer-random-string"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
@@ -1781,6 +1785,19 @@ async def list_tags(
 
 ---
 
+## 11.15.5 빈 `__init__.py` 들 (놓치기 쉬운 한 단계)
+
+본문이 `app/`, `app/routers/`, `tests/` 폴더의 파일들을 한 단계씩 채워 왔습니다. 다음 11.16 의 `from app.routers import auth as auth_router` 같은 import 가 안정적으로 동작하려면 각 폴더에 빈 `__init__.py` 가 있어야 합니다(테스트 디스커버리도 마찬가지). 아직 안 만들었다면 한 번에:
+
+```bash
+mkdir -p app/routers tests
+touch app/__init__.py app/routers/__init__.py tests/__init__.py
+```
+
+> Python 3.3+ 의 implicit namespace package 덕분에 빈 파일이 없어도 동작은 하지만, 일관된 패키지 인식·테스트 import·IDE 자동완성을 위해 명시적으로 두는 것을 권장합니다.
+
+---
+
 ## 11.16 앱 조립 — `app/main.py`
 
 ```python
@@ -1841,6 +1858,19 @@ uv run uvicorn app.main:app --reload
 ## 11.17 테스트 — `tests/conftest.py`와 `tests/test_blog.py`
 
 운영은 MySQL이지만, 테스트는 **인메모리 SQLite**로 빠르게 돕니다. SQLAlchemy 2.0의 ORM 코드는 두 DB에서 동일하게 동작합니다.
+
+### 11.17.0 `pyproject.toml` 의 pytest 설정
+
+비동기 테스트가 자동 인식되도록 `pyproject.toml` 에 다음 한 블록을 둡니다(예제 폴더는 이미 들어 있습니다).
+
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+- `asyncio_mode = "auto"` — `async def test_...` 함수가 자동으로 비동기 테스트로 인식. 없으면 데코레이터(`@pytest.mark.asyncio`)를 매 함수마다 붙여야 합니다.
+- `testpaths = ["tests"]` — `pytest` 한 줄로 `tests/` 만 디스커버.
 
 ### 11.17.1 `tests/conftest.py`
 
@@ -1973,7 +2003,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
-COPY --from=ghcr.io/astral-sh/uv:0.5.18 /uv /uvx /usr/local/bin/
+# 작성 시점 안정 태그. 새 마이너 출시 시 직접 갱신.
+COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
@@ -1990,13 +2021,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
 
+# 비루트 사용자로 실행해 권한 사고를 줄인다(컨테이너 탈출 취약점 시 호스트 root 와의 거리).
+RUN groupadd --system app && \
+    useradd --system --gid app --no-create-home --shell /usr/sbin/nologin app
+
 WORKDIR /app
 COPY --from=builder /app /app
+RUN chown -R app:app /app
+USER app
 
 EXPOSE 8000
 
-CMD ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "2", "-b", "0.0.0.0:8000"]
+# Uvicorn 자체 멀티워커(0.30+ 내장). `gunicorn -k uvicorn.workers.UvicornWorker`
+# 패턴은 deprecated 되어 별도 패키지(`uvicorn-worker`)로 분리되었습니다.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]
 ```
 
 > **멀티스테이지 빌드란?** 한 Dockerfile 안에 여러 빌드 단계를 두고, 마지막 단계에 필요한 결과물만 가져가는 방식입니다. 빌드 도구(uv, 컴파일러 등)는 최종 이미지에 들어가지 않아 이미지 크기가 작아지고, 보안 표면도 줄어듭니다.
@@ -2325,6 +2366,11 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/login \
 echo $TOKEN
 ```
 
+> **`jq` 가 없을 때** — 다음 한 줄을 그대로 쓸 수 있습니다(`jq -r .access_token` 자리에).
+> ```bash
+> python -c "import sys,json;print(json.load(sys.stdin)['access_token'])"
+> ```
+
 ### 11.24.2 글 작성 + 태그
 
 ```bash
@@ -2433,7 +2479,7 @@ curl -i -X PATCH "http://127.0.0.1:8000/posts/$POST_ID" \
 ### 11.25.2 Render
 
 - **MySQL은 별도 호스팅 또는 Render의 Private Service**(Render 자체는 PostgreSQL이 더 강함). MySQL을 외부에 둘 거면 PlanetScale·Aiven·AWS RDS 등을 검토.
-- 앱은 **Web Service**로 배포. 빌드 명령은 `uv sync --frozen --no-dev`, 시작 명령은 `gunicorn app.main:app -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT -w 2`.
+- 앱은 **Web Service**로 배포. 빌드 명령은 `uv sync --frozen --no-dev`, 시작 명령은 `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2 --proxy-headers --forwarded-allow-ips='*'`.
 - 환경 변수에 `DATABASE_URL`, `SECRET_KEY` 입력.
 - 마이그레이션은 **Job** 또는 배포 스크립트에서 `alembic upgrade head`.
 
@@ -2517,7 +2563,7 @@ curl https://api.example.com/health
 
 이 챕터를 다 마쳤는지 한 번에 점검하는 표입니다.
 
-- [ ] `uv add fastapi "uvicorn[standard]" gunicorn "sqlalchemy[asyncio]" alembic asyncmy aiosqlite pyjwt bcrypt python-slugify pydantic-settings "pydantic[email]"` 설치 완료
+- [ ] `uv add fastapi "uvicorn[standard]" "gunicorn>=23" "sqlalchemy[asyncio]>=2.0" alembic asyncmy aiosqlite pyjwt bcrypt python-slugify python-multipart pydantic-settings "pydantic[email]"` 설치 완료
 - [ ] Docker로 MySQL 8.4 컨테이너 띄움
 - [ ] `.env` 작성 완료 (`SECRET_KEY`는 `secrets.token_urlsafe(48)` 결과로 교체)
 - [ ] `app/config.py`, `app/db.py` 작성

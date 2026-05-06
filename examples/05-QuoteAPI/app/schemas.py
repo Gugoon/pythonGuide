@@ -8,7 +8,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class QuoteBase(BaseModel):
@@ -31,6 +31,8 @@ class QuoteUpdate(BaseModel):
 
 class QuoteRead(QuoteBase):
     """모든 응답에서 쓰는 출력 모델."""
+
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     created_at: datetime

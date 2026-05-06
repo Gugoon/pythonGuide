@@ -8,8 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
-# uv 설치 (Astral 공식 이미지에서 바이너리만 가져온다)
-COPY --from=ghcr.io/astral-sh/uv:0.5.18 /uv /uvx /usr/local/bin/
+# uv 설치 (Astral 공식 이미지에서 바이너리만 가져온다 — 새 마이너 출시 시 직접 갱신)
+COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
@@ -45,7 +45,12 @@ USER app
 
 EXPOSE 8000
 
-# 운영에서는 gunicorn + uvicorn worker.
+# 운영에서는 Uvicorn 자체 멀티워커(0.30+ 내장) + proxy-headers.
+# 옛 `gunicorn -k uvicorn.workers.UvicornWorker` 패턴은 deprecated 되어 별도
+# 패키지(`uvicorn-worker`)로 분리됐습니다. Gunicorn 의 graceful reload 가 꼭
+# 필요하면 `uv add uvicorn-worker` 후 `-k uvicorn_worker.UvicornWorker` 로.
 # 개발에서는 docker-compose의 command를 uvicorn --reload 로 덮어쓴다.
-CMD ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "2", "-b", "0.0.0.0:8000"]
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2", \
+     "--proxy-headers", "--forwarded-allow-ips=*"]

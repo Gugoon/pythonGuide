@@ -94,10 +94,14 @@ def decode_access_token(token: str) -> TokenPayload:
 
     `algorithms`는 반드시 리스트로, 명시적으로 한 가지만 적는다.
     이 인자를 비우거나 'none'을 포함시키면 위조 토큰이 통과될 수 있다.
+
+    `options={"require": [...]}` 로 필수 클레임을 강제한다 — exp/sub 가 없는
+    토큰은 통과시키지 않는다(만료 없는 토큰을 막기 위함).
     """
     raw = jwt.decode(
         token,
         settings.secret_key,
         algorithms=[settings.algorithm],
+        options={"require": ["exp", "sub", "iat"]},
     )
     return TokenPayload(**raw)

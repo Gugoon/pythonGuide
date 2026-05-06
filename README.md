@@ -123,7 +123,7 @@
 - **05 → 06**: 메모리 dict 저장소가 SQLAlchemy + SQLite로 교체. 라우트와 Pydantic 모델은 거의 그대로.
 - **06 → 07**: 한 파일 안의 라우트가 `app/routers/`·`app/crud.py`로 분리되고 통합 테스트(`pytest` + `httpx.AsyncClient`)가 붙음.
 - **07 → 08**: 같은 구조에 `app/security.py`(bcrypt + PyJWT)와 `app/deps.py`(`get_current_user`)가 추가.
-- **08 → 09**: 개발용 `uvicorn --reload`에서 운영용 `gunicorn -k uvicorn.workers.UvicornWorker`로.
+- **08 → 09**: 개발용 `uvicorn --reload`에서 운영용 **Uvicorn 멀티워커**(`uvicorn ... --workers N --proxy-headers`)로.
 - **09 → 10**: 이전 챕터들의 부품(SQLAlchemy 비동기 + bcrypt + JWT + Docker)을 한 프로젝트(Note API, PostgreSQL)로 통합.
 - **10 → 11**: 단일 모델(Note)에서 다중 모델(User · Post · Comment · Tag) + N:M 관계로, PostgreSQL에서 MySQL로.
 
@@ -170,8 +170,24 @@
 ## 문서 형식에 대하여
 
 - 모든 문서는 GitHub Flavored Markdown으로 작성되었습니다.
-- 최종 검토 후 `md-to-pdf` 또는 `pandoc`으로 단일 PDF로 변환할 수 있습니다.
 - 코드 블록은 언어 지정이 되어 있어 신택스 하이라이팅이 적용됩니다.
+- 패키지 마이너 버전(예: `pyjwt 2.x`, `ruff 0.x`, `mypy 1.x`)은 작성 시점 스냅샷이며, `uv add` 는 항상 lock 파일·`>=` 제약을 만족하는 최신 호환 버전을 받습니다.
+
+### 단일 PDF 변환
+
+```bash
+# 1) 단일 통합 파일을 그대로 변환 (npm: md-to-pdf)
+npx md-to-pdf fastapi-guide-complete.md
+
+# 2) docs/ 분할본을 합쳐서 (pandoc, 한글 폰트 필수)
+pandoc README.md docs/*.md -o fastapi-guide.pdf \
+  --toc --toc-depth=3 --pdf-engine=xelatex \
+  -V mainfont="Noto Sans CJK KR" \
+  -V monofont="D2Coding" \
+  -V geometry:margin=1in
+```
+
+> **한글 폰트 지정이 없으면 PDF 에서 한글이 깨집니다.** macOS 기본 폰트는 `AppleSDGothicNeo`, Linux/Windows 는 `Noto Sans CJK KR` 등 시스템에 설치된 한글 폰트로 바꿔 사용하세요. `xelatex` 또는 `lualatex` 엔진이 필요합니다(`brew install --cask mactex-no-gui` / `apt install texlive-xetex`).
 
 ---
 
