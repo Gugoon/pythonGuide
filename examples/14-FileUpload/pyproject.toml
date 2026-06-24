@@ -1,0 +1,22 @@
+[project]
+name = "file-upload"
+version = "0.1.0"
+description = "FastAPI 가이드 14장 — UploadFile 기반 파일 업로드/다운로드 예제 (검증, 안전한 저장, FileResponse)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

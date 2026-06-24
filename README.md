@@ -81,6 +81,16 @@
 ### 6부: 레퍼런스
 
 - [12. 유틸리티 및 라이브러리 — 최신 버전과 사용 예제](docs/12-utilities.md)
+
+### 7부: 심화 (선택)
+
+> 핵심 경로(01~11)를 끝낸 뒤, 필요에 따라 골라 보는 실전 주제입니다. 각 장에는 실행·테스트되는 독립 예제가 딸려 있습니다.
+
+- [13. 테스트 작성 심화 — pytest로 더 깊게](docs/13-testing-deep.md)
+- [14. 파일 업로드 — UploadFile](docs/14-file-upload.md)
+- [15. 백그라운드 작업 — BackgroundTasks](docs/15-background-tasks.md)
+- [16. 에러 핸들링·로깅 심화](docs/16-error-logging.md)
+
 - [용어 사전 (Glossary) — 모르는 단어가 나올 때 펼쳐 보세요](docs/glossary.md)
 
 ## 권장 학습 순서

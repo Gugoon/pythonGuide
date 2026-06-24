@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 가상환경
+.venv/
+venv/
+
+# 환경 변수 파일 (절대 커밋 금지)
+.env
+.env.local
+.env.*.local
+
+# 백그라운드 작업이 남기는 산출물 (예제에서 파일로 기록하는 경우)
+*.log
+audit.log
+
+# 에디터 / 운영체제
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
