@@ -68,6 +68,14 @@ lang: ko
 ## 5부. 레퍼런스
 
 - [12장. 유틸리티 및 라이브러리](#ch12)
+
+## 6부. 심화 (선택)
+
+- [13장. 테스트 작성 심화](#ch13)
+- [14장. 파일 업로드](#ch14)
+- [15장. 백그라운드 작업](#ch15)
+- [16장. 에러 핸들링·로깅 심화](#ch16)
+
 - [부록. 용어 사전](#glossary)
 
 
@@ -19471,6 +19479,3579 @@ uv add --dev ruff mypy
 ---
 
 ← [11. 종합 예제 2 — Blog API](11-project-blog-api.md) | [README로 돌아가기](../README.md)
+
+<a id="ch13"></a>
+
+# 13. 테스트 작성 심화 — pytest로 더 깊게
+
+> **이 챕터의 목표**
+> - 07·08장에서 한 번 써본 `pytest` + `httpx.AsyncClient` 통합 테스트를, **재사용 가능한 픽스처 설계**로 한 단계 끌어올린다.
+> - 픽스처의 **스코프**(function / module / session)와 `autouse` 의 의미를 손에 익히고, 의존성 오버라이드를 복습한다.
+> - `@pytest.mark.parametrize` 로 **한 테스트 함수를 여러 입력으로** 반복 실행해, 표 하나로 수십 개의 케이스를 덮는 법을 배운다.
+> - 에러·예외 케이스를 의도적으로 테스트한다 — `pytest.raises` 로 "예외가 나는 게 정상" 인 경우를, 상태 코드(404 / 422 / 503)로 HTTP 에러를 검증한다.
+> - **외부 HTTP 호출을 모킹**한다. 진짜 네트워크 없이 `monkeypatch` 로 외부 함수를 가짜로 바꿔치워, 우리 코드만 격리해서 빠르고 안정적으로 검증한다.
+> - 테스트 파일을 어떻게 나눌지(**조직화**)와 커버리지 측정(`pytest-cov`) 의 존재를 익힌다.
+
+> **소요 시간**: 2~4시간
+
+> **전제**: 07·08장을 따라 pytest 통합 테스트를 한 번 써봤다. `async def test_...`, `httpx.AsyncClient`, `ASGITransport`, `app.dependency_overrides` 라는 단어를 한 번씩 만나봤다.
+
+> **모르는 단어가 나오면** [용어 사전(glossary.md)](glossary.md)을 펼쳐 보세요. 처음 보는 용어는 한두 줄만 읽고 본문으로 돌아오면 됩니다.
+
+---
+
+## 13.1 왜 테스트를 "더 깊게" 배우는가
+
+07장에서 우리는 통합 테스트 17개를 썼다. 그때의 패턴은 단순했다.
+
+- `conftest.py` 에 `client` 픽스처 하나를 두고,
+- 테스트마다 `await client.post(...)` 로 요청을 보내고,
+- `assert res.status_code == ...` 로 응답을 확인했다.
+
+이 패턴은 강력하다. 하지만 프로젝트가 자라면 다음 질문들이 차례로 찾아온다.
+
+- "비슷한 검증을 입력만 바꿔 열 번 반복하고 있다. 복사-붙여넣기 말고 더 좋은 방법이 없을까?"
+- "이 엔드포인트는 외부 결제 API 를 부른다. 테스트할 때마다 진짜 결제가 일어나면 안 되는데?"
+- "예외가 **나야 정상** 인 경우는 어떻게 테스트하지?"
+- "픽스처를 매 테스트마다 새로 만들면 느리다. 한 번만 만들어 공유할 순 없나?"
+
+이 챕터는 그 질문들에 하나씩 답한다. 핵심 도구는 다섯 가지다.
+
+1. **픽스처 설계와 스코프** — 무엇을, 얼마나 자주 만들고 정리할지.
+2. **파라미터화**(`@pytest.mark.parametrize`) — 한 함수로 여러 입력을 덮기.
+3. **예외/에러 케이스** — `pytest.raises` 와 상태 코드 단언.
+4. **외부 호출 모킹**(`monkeypatch`) — 네트워크 없이 빠르고 안정적으로.
+5. **조직화와 커버리지** — 파일을 나누는 법, 빠진 줄을 찾는 법.
+
+> **이 챕터의 대상 앱은 일부러 작다.** 07장처럼 DB·Alembic 까지 끌고 오면 "테스트 기법" 이 그 무게에 묻힌다. 그래서 이번에는 **DB 없이 인메모리 dict 하나만 쓰는 작은 API** 를 대상으로, 오롯이 테스트 기법에만 집중한다.
+
+---
+
+## 13.2 큰 그림 — 무엇을 테스트할 것인가
+
+대상 앱은 세 종류의 엔드포인트를 가진다. 각각이 **다른 테스트 기법** 을 끌어내도록 골랐다.
+
+| 메서드 | 경로 | 설명 | 이 엔드포인트로 배우는 것 |
+|--------|------|------|---------------------------|
+| `GET` | `/health` | 헬스 체크 | 가장 단순한 테스트 |
+| `POST` | `/quotes` | 명언 생성(검증) | 파라미터화·에러 케이스(422) |
+| `GET` | `/quotes/{id}` | 단건 조회 | 404 케이스 |
+| `GET` | `/quotes` | 전체 목록 | 상태 격리(픽스처) |
+| `GET` | `/rate/{code}` | **외부 환율 API 호출** | 외부 호출 모킹 |
+
+폴더 구조는 다음과 같다. 07장보다 훨씬 가볍다.
+
+```
+13-TestingDeep/
+├── pyproject.toml
+├── .python-version
+├── .gitignore
+├── README.md
+├── app/
+│   ├── __init__.py
+│   ├── main.py            ← FastAPI 앱 (health / quotes / rate)
+│   └── services.py        ← 외부 HTTP 호출 격리 (fetch_rate)
+└── tests/
+    ├── __init__.py
+    ├── conftest.py        ← AsyncClient 픽스처 + 상태 초기화(autouse)
+    ├── test_health_and_quotes.py
+    ├── test_parametrize.py
+    └── test_rate_mock.py
+```
+
+각 파일의 한 줄 정의:
+
+| 파일 | 책임 한 줄 |
+|------|------------|
+| `app/main.py` | FastAPI 앱·스키마·엔드포인트. 인메모리 저장소 하나를 둔다 |
+| `app/services.py` | 외부 세계와 통신하는 함수(`fetch_rate`)만 격리해 둔다 |
+| `tests/conftest.py` | 공통 픽스처(`client`, `sample_quote`, 상태 초기화)를 정의한다 |
+| `tests/test_health_and_quotes.py` | 픽스처·기본 CRUD·404/422·상태 격리 |
+| `tests/test_parametrize.py` | 파라미터화·`pytest.raises` |
+| `tests/test_rate_mock.py` | 외부 호출 모킹 3종 |
+
+---
+
+## 13.3 프로젝트 만들기
+
+```bash
+mkdir 13-TestingDeep
+cd 13-TestingDeep
+
+uv init --bare
+rm -f hello.py main.py
+
+uv add fastapi "uvicorn[standard]" httpx
+uv add --dev pytest pytest-asyncio httpx
+
+mkdir -p app tests
+touch app/__init__.py tests/__init__.py
+```
+
+`pyproject.toml` 의 핵심은 다음과 같다(07장과 같은 모양).
+
+```toml
+[project]
+name = "testing-deep"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+> **`httpx` 가 두 군데 적힌 이유** : 대상 앱이 런타임에 외부 API 를 부를 때도 `httpx` 를 쓰고(`dependencies`), 테스트에서 `AsyncClient` 로 앱을 호출할 때도 `httpx` 를 쓴다(`dev`). 둘 다 같은 패키지지만 "런타임 의존성" 과 "개발 의존성" 양쪽에서 필요하다는 뜻을 명시해 둔 것이다.
+
+> **`asyncio_mode = "auto"` 복습** : 이 한 줄이 있으면 `async def test_...` 모양의 테스트가 `@pytest.mark.asyncio` 데코레이터 없이도 자동으로 비동기로 실행된다. 07장에서 이미 켜 둔 옵션이다.
+
+---
+
+## 13.4 대상 앱 — `app/services.py` (외부 호출을 한곳에 가둔다)
+
+모킹을 쉽게 하려면, 외부 세계와 통신하는 코드를 **한 함수에 가둬 두는 설계** 가 먼저다. 그래서 환율 API 호출을 `app/services.py` 의 `fetch_rate` 하나로 모은다.
+
+```python
+# app/services.py
+import httpx
+
+RATES_API_BASE = "https://api.example.com/rates"
+HTTP_TIMEOUT = 5.0
+
+
+class RateUnavailableError(Exception):
+    """환율 정보를 가져오지 못했을 때 던지는 우리 도메인 예외."""
+
+
+async def fetch_rate(code: str) -> float:
+    """통화 코드(예: "USD")에 대한 원화 환율을 외부 API 에서 가져온다."""
+    url = f"{RATES_API_BASE}/{code.upper()}"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
+            res = await http.get(url)
+            res.raise_for_status()
+            data = res.json()
+            return float(data["rate"])
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        raise RateUnavailableError(str(exc)) from exc
+```
+
+이 작은 모듈에 두 가지 설계 결정이 들어 있다.
+
+### 13.4.1 외부 호출의 "입구" 를 하나로 좁힌다
+
+라우터가 `httpx.AsyncClient(...).get(...)` 을 **직접** 부르면, 테스트할 때 그 라우터 안의 네트워크 호출을 가로채기가 까다롭다. 대신 모든 외부 호출이 `fetch_rate` 한 함수를 **반드시 거치게** 해 두면, 테스트는 이 함수 하나만 가짜로 바꾸면 된다.
+
+> **이것이 "모킹 가능한 설계" 다.** 모킹은 테스트 기법이기 전에 **설계 습관**이다. "외부와 통신하는 코드를 얇은 함수 하나로 격리" 해 두면, 나중에 그 함수만 갈아끼우거나 가짜로 만들 수 있다. 07장에서 "라우터는 HTTP 만, crud 는 DB 만" 이라고 한 것과 같은 정신이다.
+
+### 13.4.2 저수준 예외를 도메인 예외로 정규화한다
+
+`httpx` 는 상황에 따라 여러 종류의 예외를 던진다(타임아웃, 연결 실패, 4xx/5xx 등). 응답 형식이 깨지면 `KeyError`·`ValueError` 도 날 수 있다. 이걸 라우터까지 그대로 흘려보내면 라우터가 너무 많은 예외를 알아야 한다.
+
+그래서 `fetch_rate` 는 이 모두를 잡아 **우리 도메인 예외 하나**(`RateUnavailableError`)로 감싼다. 라우터는 이 예외 하나만 알면 된다(13.5 에서 503 으로 변환한다).
+
+> **`raise ... from exc` 가 뭔가요?** "이 예외는 저 예외(`exc`)가 원인이었다" 를 파이썬에 알려주는 문법이다. 로그·트레이스백에 원래 원인이 함께 남아 디버깅이 쉬워진다.
+
+---
+
+## 13.5 대상 앱 — `app/main.py`
+
+이제 앱 본체다. 인메모리 저장소 하나, 스키마 셋, 엔드포인트 다섯이 전부다.
+
+```python
+# app/main.py
+from fastapi import Depends, FastAPI, HTTPException, status
+from pydantic import BaseModel, Field
+
+from app import services
+
+app = FastAPI(
+    title="Testing Deep",
+    version="0.1.0",
+    description="13장 테스트 작성 심화 예제 — 픽스처, 파라미터화, 에러 케이스, 외부 호출 모킹.",
+)
+
+
+# --- 인메모리 저장소 ---
+_quotes: dict[int, "QuoteRead"] = {}
+_next_id = 1
+
+
+def reset_state() -> None:
+    """인메모리 저장소를 초기 상태로 되돌린다(테스트 픽스처가 호출)."""
+    global _next_id
+    _quotes.clear()
+    _next_id = 1
+
+
+# --- 스키마 ---
+class QuoteCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=280)
+    author: str = Field(min_length=1, max_length=100)
+
+
+class QuoteRead(BaseModel):
+    id: int
+    text: str
+    author: str
+
+
+class RateRead(BaseModel):
+    code: str
+    rate: float
+
+
+# --- 의존성: 외부 호출 함수를 주입 가능한 모양으로 ---
+def get_rate_fetcher():
+    return services.fetch_rate
+
+
+# --- 엔드포인트 ---
+@app.get("/health", tags=["meta"], summary="헬스 체크")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post(
+    "/quotes",
+    response_model=QuoteRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["quotes"],
+)
+async def create_quote(payload: QuoteCreate) -> QuoteRead:
+    global _next_id
+    quote = QuoteRead(id=_next_id, text=payload.text, author=payload.author)
+    _quotes[_next_id] = quote
+    _next_id += 1
+    return quote
+
+
+@app.get("/quotes/{quote_id}", response_model=QuoteRead, tags=["quotes"])
+async def get_quote(quote_id: int) -> QuoteRead:
+    quote = _quotes.get(quote_id)
+    if quote is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"명언 {quote_id} 를 찾을 수 없습니다",
+        )
+    return quote
+
+
+@app.get("/quotes", response_model=list[QuoteRead], tags=["quotes"])
+async def list_quotes() -> list[QuoteRead]:
+    return list(_quotes.values())
+
+
+@app.get("/rate/{code}", response_model=RateRead, tags=["rate"])
+async def get_rate(code: str, fetch=Depends(get_rate_fetcher)) -> RateRead:
+    if not code.isalpha() or not (2 <= len(code) <= 5):
+        raise HTTPException(
+            status_code=422,
+            detail="통화 코드는 2~5자의 알파벳이어야 합니다",
+        )
+    try:
+        rate = await fetch(code)
+    except services.RateUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"환율 정보를 가져올 수 없습니다: {exc}",
+        ) from exc
+    return RateRead(code=code.upper(), rate=rate)
+```
+
+테스트 관점에서 짚을 점 세 가지.
+
+### 13.5.1 `reset_state()` — 테스트가 비울 수 있는 상태
+
+DB 가 없으니 데이터는 모듈 수준 `_quotes` dict 에 산다. 모듈 수준 변수는 **프로세스가 사는 동안 계속 남는다**. 테스트 A 가 만든 명언이 테스트 B 에 그대로 보이면, 테스트가 서로 간섭해 깨진다.
+
+그래서 "저장소를 초기 상태로 되돌리는" `reset_state()` 함수를 노출해 둔다. 테스트는 매번 시작 전에 이 함수를 불러 **빈 저장소** 라는 같은 출발선을 보장한다(13.7 의 `reset_store` 픽스처).
+
+> **07장은 왜 이게 필요 없었나?** 07장은 매 테스트마다 새 in-memory SQLite 엔진을 `engine` 픽스처가 새로 만들었다. 즉 "상태를 새로 만드는" 일을 DB 계층이 해 줬다. 이번엔 DB 가 없으니 우리가 직접 비워야 한다. 본질은 같다 — **테스트 격리**.
+
+### 13.5.2 `get_rate_fetcher` — 외부 호출을 의존성으로
+
+`/rate/{code}` 는 `services.fetch_rate` 를 직접 부르지 않고, `Depends(get_rate_fetcher)` 로 **함수를 주입**받아 부른다. 왜 이렇게 한 단계 우회할까? 테스트에서 `app.dependency_overrides[get_rate_fetcher]` 로 이 함수를 통째로 갈아끼우는 길이 열리기 때문이다(13.9 의 방법 2). `monkeypatch` 방식과 함께, **모킹의 두 갈래**를 모두 보여주기 위한 설계다.
+
+### 13.5.3 에러를 상태 코드로 일관 변환
+
+- 통화 코드 형식이 틀리면 → **422**(외부 호출 전에 막는다).
+- 외부가 실패해 `RateUnavailableError` 가 올라오면 → **503 Service Unavailable**.
+
+"내 잘못(클라이언트 입력)" 은 4xx, "남의 잘못(외부 서비스)" 은 5xx 로 가른다. 이 구분을 테스트로 못박을 것이다.
+
+> **`status.HTTP_422_...` 대신 그냥 `422` 를 쓴 이유** : FastAPI/Starlette 버전에 따라 422 상수의 이름이 달라지는 시기가 있었다(`UNPROCESSABLE_ENTITY` ↔ `UNPROCESSABLE_CONTENT`). 숫자 `422` 로 직접 쓰면 버전과 무관하게 안전하다. 다른 코드(201/404/503)는 이름이 안정적이라 `status.` 상수를 그대로 쓴다.
+
+---
+
+## 13.6 픽스처 설계와 스코프
+
+이제 테스트의 토대인 **픽스처**를 본격적으로 들여다본다.
+
+### 13.6.1 픽스처 다시 보기
+
+픽스처는 "테스트가 시작될 때 미리 준비하고, 끝날 때 정리할 자원" 을 함수로 묶은 것이다. 테스트(또는 다른 픽스처)가 **인자로 그 이름을 적으면**, pytest 가 알아서 값을 만들어 넣어 준다.
+
+```python
+@pytest.fixture
+def sample_quote() -> dict:
+    return {"text": "...", "author": "..."}
+
+
+async def test_무언가(client, sample_quote):  # ← 이름만 적으면 주입된다
+    ...
+```
+
+`yield` 를 쓰면 "준비 → (테스트 실행) → 정리" 를 한 함수로 표현할 수 있다.
+
+```python
+@pytest_asyncio.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac          # ← 여기서 테스트로 값이 넘어간다
+    # 테스트가 끝나면 async with 블록을 빠져나오며 자동 정리
+```
+
+### 13.6.2 스코프 — 얼마나 자주 만들고 버릴까
+
+픽스처에는 **스코프**가 있다. "이 자원을 얼마나 오래 살려둘 것인가" 를 정한다.
+
+| 스코프 | 의미 | 언제 쓰나 |
+|--------|------|-----------|
+| `function`(기본) | 테스트 함수마다 새로 만들고 정리 | 격리가 중요한 대부분의 경우 |
+| `class` | 한 테스트 클래스 안에서 공유 | 클래스 단위로 묶인 셋업 |
+| `module` | 한 파일 안에서 공유 | 파일 내 모든 테스트가 같은 무거운 자원을 써도 될 때 |
+| `session` | 테스트 전체 실행에서 단 한 번 | 아주 무거운 1회성 준비(예: 컨테이너 기동) |
+
+스코프는 데코레이터에 적는다.
+
+```python
+@pytest.fixture(scope="session")
+def expensive_resource():
+    ...
+```
+
+> **스코프는 "속도 ↔ 격리" 의 트레이드오프다.** 넓은 스코프(session)는 한 번만 만들어 **빠르지만**, 여러 테스트가 같은 객체를 공유하므로 **상태가 새기 쉽다**. 좁은 스코프(function)는 매번 새로 만들어 **느리지만 격리가 확실하다**. 입문 단계의 안전한 기본값은 **function 스코프**다. 우리 예제의 `client` 도 function 스코프(기본값)다.
+
+> **흔한 함정** : 무거운 자원을 빠르게 하려고 스코프를 `module` 로 넓혔다가, 한 테스트가 만든 데이터가 다음 테스트에 새서 "어떤 건 통과하고 어떤 건 실패" 하는 현상을 만난다. 07장 트러블슈팅에서도 같은 함정을 다뤘다. 넓힐 거면 "상태를 비우는 장치" 를 반드시 함께 둔다.
+
+### 13.6.3 `autouse` — 적지 않아도 켜지는 픽스처
+
+보통 픽스처는 테스트가 **인자로 이름을 적어야** 동작한다. 그런데 "모든 테스트에 무조건 적용하고 싶은" 셋업도 있다. 그럴 때 `autouse=True` 를 쓴다.
+
+```python
+@pytest.fixture(autouse=True)
+def reset_store():
+    reset_state()
+```
+
+이렇게 두면 테스트 함수가 `reset_store` 를 인자로 적지 않아도, 매 테스트 전에 자동으로 실행된다. 우리 예제에서는 **인메모리 저장소를 비우는 일** 을 이 방식으로 강제한다.
+
+---
+
+## 13.7 `tests/conftest.py`
+
+공통 픽스처를 한곳에 모은다. **같은 폴더의 모든 테스트 파일이 import 없이** 여기 픽스처를 쓸 수 있다 — 이것이 `conftest.py` 의 핵심이다.
+
+```python
+# tests/conftest.py
+from collections.abc import AsyncGenerator
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app, reset_state
+
+
+@pytest.fixture(autouse=True)
+def reset_store() -> None:
+    """매 테스트 시작 전에 인메모리 저장소를 초기화한다."""
+    reset_state()
+
+
+@pytest_asyncio.fixture
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    """ASGI 트랜스포트로 앱에 직접 요청을 보내는 비동기 클라이언트."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.fixture
+def sample_quote() -> dict:
+    """기본 명언 생성 페이로드. 테스트마다 살짝 바꿔 쓴다."""
+    return {"text": "단순함은 신뢰성의 전제 조건이다.", "author": "Dijkstra"}
+```
+
+세 픽스처를 한 줄씩 짚자.
+
+1. **`reset_store`** — `autouse=True`. 매 테스트 전에 `reset_state()` 를 불러 저장소를 비운다. 테스트는 이 픽스처를 인자로 적을 필요가 없다.
+2. **`client`** — 07·08장과 같은 패턴. `ASGITransport(app=app)` 로 진짜 네트워크 없이 앱에 직접 요청을 보내는 비동기 클라이언트. DB 가 없으니 07장의 `engine`·`session_factory` 픽스처는 필요 없다 — 훨씬 가볍다.
+3. **`sample_quote`** — 여러 테스트가 공유하는 기본 페이로드. 한 군데서 정의해 두면, 페이로드 형식이 바뀌어도 한 곳만 고치면 된다.
+
+> **`@pytest.fixture` vs `@pytest_asyncio.fixture`** : 동기 픽스처(`reset_store`, `sample_quote`)는 일반 `@pytest.fixture` 로 충분하다. `async def` 로 만들고 `yield` 해야 하는 비동기 픽스처(`client`)는 `@pytest_asyncio.fixture` 를 쓴다. `asyncio_mode = "auto"` 가 켜져 있어도 **픽스처 데코레이터는 자동 변환되지 않으니** 비동기 픽스처에는 명시적으로 이 데코레이터를 붙인다.
+
+---
+
+## 13.8 기본 CRUD·에러 케이스 테스트
+
+첫 테스트 파일이다. 픽스처를 쓰고, 정상 케이스와 **에러 케이스**(404 / 422)를 함께 다룬다.
+
+```python
+# tests/test_health_and_quotes.py
+from httpx import AsyncClient
+
+
+class TestHealth:
+    async def test_헬스_체크는_ok_를_돌려준다(self, client: AsyncClient) -> None:
+        res = await client.get("/health")
+        assert res.status_code == 200
+        assert res.json() == {"status": "ok"}
+
+
+class TestCreateQuote:
+    async def test_정상_생성은_201_과_본문을_돌려준다(
+        self, client: AsyncClient, sample_quote: dict
+    ) -> None:
+        res = await client.post("/quotes", json=sample_quote)
+        assert res.status_code == 201
+
+        body = res.json()
+        assert body["id"] == 1
+        assert body["text"] == sample_quote["text"]
+        assert body["author"] == sample_quote["author"]
+
+    async def test_빈_본문이면_422(self, client: AsyncClient) -> None:
+        res = await client.post("/quotes", json={})
+        assert res.status_code == 422
+
+    async def test_text_가_280자를_넘으면_422(self, client: AsyncClient) -> None:
+        too_long = "가" * 281
+        res = await client.post("/quotes", json={"text": too_long, "author": "익명"})
+        assert res.status_code == 422
+
+
+class TestReadQuote:
+    async def test_없는_id_조회는_404(self, client: AsyncClient) -> None:
+        res = await client.get("/quotes/9999")
+        assert res.status_code == 404
+        assert "9999" in res.json()["detail"]
+
+    async def test_생성_후_단건_조회가_가능하다(
+        self, client: AsyncClient, sample_quote: dict
+    ) -> None:
+        created = (await client.post("/quotes", json=sample_quote)).json()
+
+        res = await client.get(f"/quotes/{created['id']}")
+        assert res.status_code == 200
+        assert res.json()["author"] == sample_quote["author"]
+```
+
+### 13.8.1 에러 케이스는 "성공만큼" 중요하다
+
+초보 단계에서는 "정상 동작이 되는지" 만 테스트하기 쉽다. 하지만 진짜 버그는 **에러 경로**에서 더 자주 산다.
+
+- 없는 자원을 조회하면 정말 404 가 나는가? (혹시 500 으로 터지진 않나?)
+- 잘못된 입력에 정말 422 가 나는가? (혹시 그냥 통과해 저장되진 않나?)
+- 에러 메시지에 식별자가 들어 있는가? (`assert "9999" in res.json()["detail"]`)
+
+이런 단언을 함께 두면, 나중에 누군가 코드를 바꾸다 에러 처리를 깨뜨려도 테스트가 즉시 잡아 준다.
+
+### 13.8.2 상태 격리를 테스트로 증명하기
+
+`reset_store` 픽스처가 정말로 동작하는지, 두 테스트로 직접 보여준다.
+
+```python
+class TestIsolation:
+    """reset_store(autouse) 픽스처가 테스트 사이 상태를 비우는지 확인."""
+
+    async def test_첫_테스트에서_명언을_하나_만든다(
+        self, client: AsyncClient, sample_quote: dict
+    ) -> None:
+        await client.post("/quotes", json=sample_quote)
+        res = await client.get("/quotes")
+        assert len(res.json()) == 1
+
+    async def test_두번째_테스트는_빈_저장소에서_시작한다(
+        self, client: AsyncClient
+    ) -> None:
+        res = await client.get("/quotes")
+        assert res.json() == []
+
+        created = (
+            await client.post("/quotes", json={"text": "처음부터 다시", "author": "익명"})
+        ).json()
+        assert created["id"] == 1   # ← id 카운터까지 초기화됐다
+```
+
+첫 테스트가 명언을 하나 만들지만, 둘째 테스트는 **빈 목록** 에서 시작하고 새 id 가 다시 `1` 이다. `reset_store` 가 매번 저장소와 id 카운터를 모두 비운다는 증거다.
+
+> **테스트는 순서에 의존하면 안 된다.** 위 두 테스트의 실행 순서가 바뀌어도, 파일 하나만 돌리든 전체를 돌리든 항상 통과해야 한다. `autouse` 초기화 픽스처가 그 독립성을 보장한다.
+
+---
+
+## 13.9 파라미터화 — 한 함수로 여러 입력을 덮기
+
+같은 검증을 입력만 바꿔 반복하고 있다면, `@pytest.mark.parametrize` 가 답이다.
+
+### 13.9.1 기본 형태
+
+```python
+# tests/test_parametrize.py
+import pytest
+from httpx import AsyncClient
+
+
+class TestQuoteValidationParametrized:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},                                   # 둘 다 누락
+            {"text": "본문만 있음"},               # author 누락
+            {"author": "저자만 있음"},             # text 누락
+            {"text": "", "author": "익명"},        # text 빈 문자열
+            {"text": "정상", "author": ""},        # author 빈 문자열
+            {"text": "가" * 281, "author": "익명"},  # text 너무 김
+        ],
+    )
+    async def test_잘못된_본문은_모두_422(
+        self, client: AsyncClient, payload: dict
+    ) -> None:
+        res = await client.post("/quotes", json=payload)
+        assert res.status_code == 422
+```
+
+이 한 함수가 **6개의 독립된 테스트** 로 펼쳐진다. pytest 출력에서도 6줄로 따로 보인다.
+
+```
+test_잘못된_본문은_모두_422[payload0] PASSED
+test_잘못된_본문은_모두_422[payload1] PASSED
+...
+```
+
+각 케이스가 따로 실행되므로, 하나가 실패해도 **어떤 입력에서** 실패했는지 정확히 보인다. 복사-붙여넣기로 만든 6개 함수보다 훨씬 낫다.
+
+### 13.9.2 인자가 여러 개일 때
+
+값 묶음을 튜플로 넘기고, 첫 인자에 이름을 콤마로 나열한다.
+
+```python
+@pytest.mark.parametrize(
+    ("text", "author"),
+    [
+        ("짧은 명언", "A"),
+        ("가" * 280, "경계값 저자"),     # text 최대 길이 경계(280)
+        ("이모지도 된다 🚀", "유니코드"),
+    ],
+)
+async def test_경계값_본문은_201(
+    self, client: AsyncClient, text: str, author: str
+) -> None:
+    res = await client.post("/quotes", json={"text": text, "author": author})
+    assert res.status_code == 201
+    assert res.json()["text"] == text
+```
+
+> **경계값을 꼭 넣자.** `max_length=280` 이라면 "280자(통과)" 와 "281자(실패)" 를 둘 다 테스트한다. 버그는 경계에서 가장 많이 산다. 위에서 280자는 성공 케이스에, 281자는 실패 케이스(13.9.1)에 넣어 양쪽을 덮었다.
+
+> **`parametrize` 와 픽스처는 함께 쓴다.** 위 예에서 `client` 는 픽스처로 주입되고, `text`·`author` 는 파라미터로 주입된다. 둘은 충돌하지 않고 자연스럽게 섞인다.
+
+---
+
+## 13.10 예외 단언 — `pytest.raises`
+
+지금까지는 HTTP 응답의 **상태 코드** 로 에러를 확인했다. 그런데 라우터를 거치지 않고 **함수·클래스를 직접** 테스트할 때는, "예외가 던져지는 것 자체" 를 단언해야 한다. 그게 `pytest.raises` 다.
+
+```python
+class TestPydanticRaises:
+    def test_정상_입력은_검증을_통과한다(self) -> None:
+        model = QuoteCreate(text="유효한 본문", author="작가")
+        assert model.author == "작가"
+
+    def test_빈_text_는_ValidationError(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc_info:
+            QuoteCreate(text="", author="작가")
+
+        assert exc_info.value.error_count() == 1
+        assert exc_info.value.errors()[0]["loc"] == ("text",)
+```
+
+(`QuoteCreate` 는 `from app.main import QuoteCreate` 로 가져온다.)
+
+핵심은 다음과 같다.
+
+- **`with pytest.raises(ValidationError):`** — 이 블록 안에서 `ValidationError` 가 나면 통과, **안 나면 실패**다. "예외가 나는 게 정상" 인 케이스를 정확히 표현한다.
+- **`as exc_info`** — 잡힌 예외 객체를 받아 더 들여다본다. `exc_info.value` 가 실제 예외 인스턴스다. 여기서는 "어느 필드에서(`loc == ("text",)`) 몇 개(`error_count() == 1`) 실패했는지" 까지 확인했다.
+
+> **이 테스트들은 `async` 가 아니다.** Pydantic 모델 생성은 동기 코드라 평범한 `def test_...` 로 쓴다. 같은 파일에 `async def` 테스트(파라미터화)와 `def` 테스트(예외 단언)가 섞여 있어도 `pytest-asyncio` 가 각각 알아서 처리한다.
+
+> **`pytest.raises` 의 `match=` 옵션** : `pytest.raises(ValueError, match="invalid")` 처럼 예외 메시지를 정규식으로 함께 확인할 수도 있다. 메시지가 사양의 일부라면 유용하다.
+
+---
+
+## 13.11 외부 HTTP 호출 모킹 — 이 챕터의 하이라이트
+
+이제 가장 중요한 절이다. `/rate/{code}` 는 외부 환율 API 를 부른다. 테스트에서 진짜 네트워크를 타면 세 가지가 나빠진다.
+
+- **느리다** — 매 테스트가 외부 응답을 기다린다.
+- **불안정하다** — 외부가 잠깐 죽으면 우리 테스트가 빨개진다(우리 잘못이 아닌데도).
+- **통제 불가** — "외부가 500 을 줄 때 우리가 503 으로 변환하는가" 같은 케이스를 외부에 강요할 수 없다.
+
+그래서 외부 호출을 **가짜로 바꿔치운다(mocking)**. 핵심 도구는 pytest 내장 픽스처 `monkeypatch` 다.
+
+### 13.11.1 `monkeypatch` 가 뭔가요
+
+`monkeypatch` 는 "테스트 동안만 어떤 속성·함수·환경 변수를 임시로 바꿔치우고, 테스트가 끝나면 자동으로 원래대로 되돌려 주는" pytest 내장 픽스처다. 인자로 `monkeypatch` 라고 적기만 하면 쓸 수 있다.
+
+가장 많이 쓰는 메서드는 `setattr` 이다.
+
+```python
+monkeypatch.setattr(대상모듈, "속성이름", 새값)
+```
+
+"테스트가 끝나면 자동 복원" 이 핵심이다. 직접 `services.fetch_rate = ...` 로 바꾸면 그 변경이 다음 테스트에까지 새지만, `monkeypatch` 로 바꾸면 그 테스트가 끝날 때 깔끔히 원복된다.
+
+### 13.11.2 방법 1 — 외부 함수 자체를 교체
+
+가장 직관적이다. `services.fetch_rate` 를 가짜 코루틴으로 바꾼다.
+
+```python
+# tests/test_rate_mock.py
+import httpx
+import pytest
+
+from app import services
+from app.main import app, get_rate_fetcher
+
+
+class TestRateWithMonkeypatch:
+    async def test_가짜_환율을_돌려주도록_교체한다(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_fetch_rate(code: str) -> float:
+            return 1387.5    # 진짜 네트워크 대신 고정값
+
+        monkeypatch.setattr(services, "fetch_rate", fake_fetch_rate)
+
+        res = await client.get("/rate/usd")
+        assert res.status_code == 200
+        assert res.json() == {"code": "USD", "rate": 1387.5}
+```
+
+라우터의 의존성 `get_rate_fetcher` 가 `services.fetch_rate` 를 돌려주므로, **모듈의 그 속성을 바꾸면** 라우터가 가짜를 부르게 된다. 진짜 네트워크는 한 번도 일어나지 않는다.
+
+> **왜 `app.main.fetch_rate` 가 아니라 `services.fetch_rate` 를 패치하나?** `get_rate_fetcher` 안이 `return services.fetch_rate` 라서, 함수가 **불릴 때** `services` 모듈에서 속성을 조회한다. 그래서 `services` 모듈의 속성을 바꾸면 충분하다. 만약 `main.py` 가 `from app.services import fetch_rate` 로 **이름을 복사해 왔다면**, `app.main.fetch_rate` 를 패치해야 했을 것이다. "어디서 그 이름을 찾는가" 를 따라가는 게 모킹의 핵심 감각이다.
+
+### 13.11.3 실패 경로도 모킹으로 만든다
+
+외부가 실패하는 상황을 **마음대로** 만들 수 있다는 게 모킹의 큰 장점이다.
+
+```python
+    async def test_외부가_실패하면_503_으로_변환된다(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def failing_fetch_rate(code: str) -> float:
+            raise services.RateUnavailableError("upstream 500")
+
+        monkeypatch.setattr(services, "fetch_rate", failing_fetch_rate)
+
+        res = await client.get("/rate/usd")
+        assert res.status_code == 503
+        assert "환율 정보를 가져올 수 없습니다" in res.json()["detail"]
+```
+
+진짜 외부 API 를 죽이지 않고도, "외부가 죽었을 때 우리는 503 을 준다" 는 사양을 검증했다.
+
+### 13.11.4 가짜 함수가 받은 인자를 검증한다
+
+가짜 함수에 기록 장치를 달면, "라우터가 우리 함수를 **올바른 인자로, 올바른 횟수** 불렀는가" 까지 확인할 수 있다.
+
+```python
+    async def test_가짜_함수가_받은_인자를_검증한다(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        async def recording_fetch_rate(code: str) -> float:
+            calls.append(code)
+            return 100.0
+
+        monkeypatch.setattr(services, "fetch_rate", recording_fetch_rate)
+
+        await client.get("/rate/eur")
+        assert calls == ["eur"]    # 정확히 한 번, "eur" 로 불렸다
+```
+
+> **이것이 "스파이(spy)" 패턴이다.** 가짜로 바꾸되, 호출 기록을 남겨 두고 나중에 검증한다. "외부를 부르긴 했나? 몇 번? 어떤 인자로?" 같은 상호작용을 확인할 때 쓴다.
+
+### 13.11.5 외부 호출 전에 막히는 케이스
+
+잘못된 통화 코드는 **외부 호출 전에** 422 로 막혀야 한다. 가짜 함수가 아예 안 불리는지 확인한다.
+
+```python
+    @pytest.mark.parametrize("bad_code", ["1", "U", "TOOLONG", "U$D"])
+    async def test_잘못된_코드_형식은_외부_호출_전에_422(
+        self, client, monkeypatch: pytest.MonkeyPatch, bad_code: str
+    ) -> None:
+        called = False
+
+        async def should_not_be_called(code: str) -> float:
+            nonlocal called
+            called = True
+            return 0.0
+
+        monkeypatch.setattr(services, "fetch_rate", should_not_be_called)
+
+        res = await client.get(f"/rate/{bad_code}")
+        assert res.status_code == 422
+        assert called is False    # 형식 검증에서 막혔으니 외부는 안 불린다
+```
+
+파라미터화와 모킹을 한 테스트에서 함께 쓴 예다. 네 가지 잘못된 코드 모두 422 이고, 외부 호출은 한 번도 일어나지 않는다.
+
+---
+
+## 13.12 모킹의 다른 두 갈래
+
+`monkeypatch` 만 모킹의 길은 아니다. 상황에 맞는 다른 두 방법을 짧게 본다.
+
+### 13.12.1 방법 2 — `dependency_overrides` 로 의존성 교체
+
+FastAPI 의 의존성 주입을 통째로 갈아끼우는 방법이다(07·08장에서 `get_session` 에 썼던 그 패턴).
+
+```python
+class TestRateWithDependencyOverride:
+    async def test_의존성_오버라이드로_가짜_fetcher_를_주입한다(
+        self, client
+    ) -> None:
+        async def fake_fetch(code: str) -> float:
+            return 9.99
+
+        app.dependency_overrides[get_rate_fetcher] = lambda: fake_fetch
+        try:
+            res = await client.get("/rate/jpy")
+            assert res.status_code == 200
+            assert res.json() == {"code": "JPY", "rate": 9.99}
+        finally:
+            app.dependency_overrides.clear()    # 반드시 정리
+```
+
+`get_rate_fetcher` 가 **돌려주는 함수** 자체를 가짜로 바꾼다. `monkeypatch` 와 결과는 같지만, "FastAPI 의 의존성 경계" 에서 갈아끼운다는 점이 다르다.
+
+> **둘 중 무엇을 쓰나?** 외부 호출이 **의존성(`Depends`)으로 주입되어 있으면** `dependency_overrides` 가 가장 깔끔하다. 그게 아니라 코드 어딘가에서 **모듈 함수를 직접 부르고 있으면** `monkeypatch` 가 답이다. 우리 앱은 둘 다 가능하도록 설계해 두어 양쪽을 보여줬다.
+
+> **`finally` 의 `clear()` 를 잊지 말자.** `dependency_overrides` 는 앱 전역 상태다. 정리하지 않으면 그 오버라이드가 다음 테스트에까지 새서, 엉뚱한 테스트가 깨진다. (07장 conftest 의 `client` 픽스처는 이 정리를 픽스처 안에서 자동으로 했다.)
+
+### 13.12.2 방법 3 — `httpx.MockTransport` 로 HTTP 레이어만 가짜로
+
+지금까지는 `fetch_rate` 함수를 통째로 바꿨다. 그러면 함수 **안쪽 로직**(URL 조립, 응답 파싱, 예외 정규화)은 테스트되지 않는다. 그 안쪽까지 검증하려면, `fetch_rate` 는 진짜로 돌리되 **HTTP 레이어만** 가짜로 만든다. `httpx.MockTransport` 가 그 도구다.
+
+```python
+class TestFetchRateUnit:
+    async def test_정상_응답을_파싱한다(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            return httpx.Response(200, json={"rate": 1400.0})
+
+        transport = httpx.MockTransport(handler)
+
+        # AsyncClient 를 만들 때 우리 transport 가 끼워지도록 감싼다.
+        real_async_client = httpx.AsyncClient
+
+        def patched_async_client(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_async_client(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+
+        rate = await services.fetch_rate("usd")
+        assert rate == 1400.0
+        assert captured["url"].endswith("/USD")    # 대문자로 조립됐는지
+```
+
+여기서 일어나는 일:
+
+- **`handler`** — 들어온 요청을 받아 가짜 `httpx.Response` 를 돌려주는 함수. 진짜 서버 대신 이 함수가 응답한다.
+- **`MockTransport(handler)`** — 그 핸들러를 쓰는 가짜 트랜스포트. 07장 conftest 의 `ASGITransport` 와 사촌지간이다(트랜스포트를 바꿔 네트워크를 우회한다).
+- **`patched_async_client`** — `fetch_rate` 안의 `httpx.AsyncClient(...)` 가 우리 트랜스포트를 쓰도록, `AsyncClient` 생성을 감싼다.
+
+이 방식이면 `fetch_rate` 의 **실제 로직** 까지 검증된다. URL 이 대문자 코드로 잘 조립되는지(`/USD`), 5xx 응답이 `RateUnavailableError` 로 정규화되는지, 형식이 깨진 응답도 같은 예외가 되는지 모두 확인할 수 있다.
+
+```python
+    async def test_5xx_응답은_RateUnavailableError(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        transport = httpx.MockTransport(handler)
+        real_async_client = httpx.AsyncClient
+
+        def patched_async_client(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_async_client(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+
+        with pytest.raises(services.RateUnavailableError):
+            await services.fetch_rate("usd")
+```
+
+> **세 방법을 어떻게 고르나?**
+> - **함수만 바꾸면 충분**하고 라우터를 검증하려면 → `monkeypatch` 로 함수 교체(방법 1).
+> - **의존성으로 주입**되어 있으면 → `dependency_overrides`(방법 2).
+> - **함수 안쪽 로직(파싱·예외 변환)까지** 검증하려면 → `MockTransport` 로 HTTP 레이어만(방법 3).
+>
+> 입문 단계에서 가장 자주 쓰는 건 방법 1이다. 방법 3은 "외부 클라이언트 코드 자체" 를 짤 때 진가를 발휘한다.
+
+---
+
+## 13.13 테스트 조직화
+
+테스트가 늘어나면 "어떻게 나눌까" 가 문제가 된다. 우리 예제의 분할 기준은 단순하다.
+
+```
+tests/
+├── conftest.py                  ← 공통 픽스처(모든 파일이 공유)
+├── test_health_and_quotes.py    ← 기본 CRUD·에러 케이스
+├── test_parametrize.py          ← 파라미터화·예외 단언
+└── test_rate_mock.py            ← 외부 호출 모킹
+```
+
+권장 습관 몇 가지.
+
+- **파일은 기능/주제 단위로 나눈다.** 라우터별(`test_quotes.py`, `test_rate.py`)로 나누는 것도 흔하고 좋다. 한 파일이 너무 길어지면(수백 줄) 쪼갠다.
+- **클래스로 관련 테스트를 묶는다.** `class TestCreateQuote:` 처럼 묶으면, 출력에서도 그룹으로 보이고 공통 셋업을 클래스 픽스처로 둘 수도 있다. (테스트 클래스에는 `__init__` 을 두지 않는다.)
+- **테스트 함수 이름이 곧 사양이 되게 한다.** 이 가이드는 한국어로 적는다. `test_없는_id_조회는_404` 처럼.
+- **공통 픽스처는 `conftest.py` 로.** 한 파일에서만 쓰는 픽스처는 그 파일 안에 둬도 된다.
+
+자주 쓰는 실행 명령:
+
+```bash
+uv run pytest                      # 전체
+uv run pytest -v                   # 테스트 이름까지 자세히
+uv run pytest tests/test_rate_mock.py          # 한 파일만
+uv run pytest -k "모킹 or 422"     # 이름에 키워드가 든 것만
+uv run pytest -x                   # 처음 실패에서 멈춤
+uv run pytest --lf                 # 직전에 실패한(last-failed) 것만 다시
+```
+
+> **마커로 묶기** : 느린 테스트에 `@pytest.mark.slow` 를 달아 두고 `pytest -m "not slow"` 로 평소엔 건너뛰는 식의 운영도 가능하다. 커스텀 마커를 쓸 땐 `pyproject.toml` 의 `[tool.pytest.ini_options]` 에 `markers = ["slow: 느린 테스트"]` 로 등록해 경고를 없앤다. 우리 예제는 마커 없이도 충분히 빨라서 쓰지 않았다.
+
+---
+
+## 13.14 커버리지 측정 (`pytest-cov`)
+
+"테스트가 코드의 어느 부분을 **실제로 실행했는지**" 를 숫자로 보여주는 게 커버리지다. 빠뜨린 분기를 찾는 데 좋다.
+
+> **우리 예제 테스트는 순수 pytest 로만 돈다.** 커버리지는 **선택 도구**다. 보고 싶을 때만 `pytest-cov` 를 추가로 깔면 된다. 테스트 자체는 `pytest-cov` 없이도 그대로 통과한다.
+
+설치와 실행:
+
+```bash
+uv add --dev pytest-cov
+uv run pytest --cov=app --cov-report=term-missing
+```
+
+`--cov=app` 은 "`app` 패키지의 커버리지를 재라", `--cov-report=term-missing` 은 "터미널에 **실행 안 된 줄 번호까지** 보여줘" 라는 뜻이다. 출력은 대략 이렇게 생겼다.
+
+```
+Name                 Stmts   Miss  Cover   Missing
+--------------------------------------------------
+app/__init__.py          0      0   100%
+app/main.py             48      0   100%
+app/services.py         16      0   100%
+--------------------------------------------------
+TOTAL                   64      0   100%
+```
+
+> **커버리지 100%가 목표는 아니다.** 커버리지는 "실행된 줄" 만 본다. "그 줄이 **올바르게** 동작하는지" 는 못 본다. 즉 100% 라도 단언이 허술하면 버그를 놓친다. 커버리지는 **빠뜨린 곳을 찾는 지도**로 쓰되, 숫자 자체를 신앙하지는 말자. 의미 있는 단언이 먼저다.
+
+> **HTML 리포트** : `--cov-report=html` 을 주면 `htmlcov/` 폴더에 색칠된 리포트가 생긴다(빨간 줄 = 실행 안 됨). 브라우저로 열어 보면 어디가 비었는지 한눈에 보인다. `.gitignore` 에 `htmlcov/`, `.coverage` 를 넣어 두자.
+
+---
+
+## 13.15 실행 — 전부 통과시키기
+
+```bash
+uv run pytest -v
+```
+
+성공하면 다음과 비슷한 출력이 나온다(총 30개).
+
+```
+tests/test_health_and_quotes.py::TestHealth::test_헬스_체크는_ok_를_돌려준다 PASSED
+tests/test_health_and_quotes.py::TestCreateQuote::test_정상_생성은_201_과_본문을_돌려준다 PASSED
+...
+tests/test_parametrize.py::TestQuoteValidationParametrized::test_잘못된_본문은_모두_422[payload0] PASSED
+...
+tests/test_rate_mock.py::TestRateWithMonkeypatch::test_가짜_환율을_돌려주도록_교체한다 PASSED
+tests/test_rate_mock.py::TestFetchRateUnit::test_정상_응답을_파싱한다 PASSED
+...
+============================== 30 passed in 0.04s ==============================
+```
+
+매 테스트가 `reset_store` 로 깨끗한 상태에서 시작하고, 외부 호출은 모두 모킹되므로 **순서에 의존하지 않고** **네트워크 없이** 0.1초 안에 끝난다.
+
+> **서버를 직접 띄워 `/rate/usd` 를 누르면?** 503 이 난다. 실제 외부 주소(`https://api.example.com/rates`)는 우리 데모용 가짜라 닿지 못하기 때문이다. **이 엔드포인트의 정상 동작은 테스트의 모킹으로 확인하는 것** 이 이 예제의 핵심이다 — 바로 그래서 모킹을 배우는 것이다.
+
+---
+
+## 13.16 흔한 실수 / 트러블슈팅
+
+### 13.16.1 비동기 픽스처에 `@pytest.fixture` 를 썼다
+
+`async def` 픽스처에 일반 `@pytest.fixture` 를 붙이면, 테스트에 코루틴 객체가 그대로 주입되어 이상하게 깨진다. 비동기 픽스처는 `@pytest_asyncio.fixture` 를 써야 한다. (`asyncio_mode = "auto"` 는 **테스트 함수**만 자동 처리하지, 픽스처 데코레이터까지 바꾸진 않는다.)
+
+### 13.16.2 모킹했는데 진짜 함수가 불린다
+
+`monkeypatch.setattr` 의 **대상**이 틀렸을 때다. "그 이름을 실제로 어디서 찾는가" 를 따라가야 한다. `get_rate_fetcher` 가 `return services.fetch_rate` 라면 `services` 모듈을 패치한다. 만약 `main.py` 가 `from app.services import fetch_rate` 로 이름을 복사해 왔다면 `app.main.fetch_rate` 를 패치해야 한다.
+
+### 13.16.3 한 테스트는 통과, 전체로 돌리면 깨진다
+
+테스트 사이에 상태가 새고 있다. 우리 예제에서는 `reset_store` (autouse) 가 인메모리 저장소를 비워 막는다. `dependency_overrides` 를 쓴 테스트가 `clear()` 를 빠뜨렸을 때도 같은 증상이 난다 — `finally` 에서 반드시 정리하자.
+
+### 13.16.4 `parametrize` 케이스가 하나도 안 보인다
+
+데코레이터 인자 이름과 테스트 함수 인자 이름이 어긋났을 때다. `@pytest.mark.parametrize("payload", [...])` 라면 테스트 함수도 `..., payload)` 로 같은 이름을 받아야 한다.
+
+### 13.16.5 `pytest.raises` 블록이 통과하지 않는다
+
+블록 안에서 예외가 **안 났을 때** `pytest.raises` 는 실패한다("DID NOT RAISE"). 기대한 예외 타입이 맞는지, 정말 그 코드가 예외를 던지는지 확인한다. 너무 넓은 타입(`Exception`)보다 구체적인 타입(`ValidationError`)으로 좁히는 게 좋다.
+
+### 13.16.6 외부 호출이 테스트에서 느리거나 빨갛다
+
+진짜 네트워크를 타고 있다는 신호다. 모킹이 적용되지 않았을 가능성이 높다(13.16.2 참고). 테스트는 외부 세계에 닿으면 안 된다 — 그게 모킹의 존재 이유다.
+
+### 13.16.7 `pytest-cov` 가 없다고 에러
+
+커버리지는 선택 도구다. `--cov` 옵션은 `pytest-cov` 가 깔려 있을 때만 동작한다. `uv add --dev pytest-cov` 로 설치하거나, 옵션 없이 `uv run pytest` 로 돌리면 된다.
+
+---
+
+## 13.17 이 챕터 요약
+
+- **픽스처는 스코프로 "속도 ↔ 격리" 를 조절한다.** 입문의 안전한 기본값은 function 스코프. 넓힐 거면 상태를 비우는 장치를 함께 둔다. 모두에 적용할 셋업은 `autouse=True`.
+- **`conftest.py`** 에 공통 픽스처를 모으면 같은 폴더의 모든 테스트가 import 없이 공유한다. 비동기 픽스처에는 `@pytest_asyncio.fixture`.
+- **`@pytest.mark.parametrize`** 로 한 함수가 여러 입력으로 펼쳐진다. 경계값(280/281)을 꼭 함께 넣는다. 실패 시 어떤 입력에서 깨졌는지 정확히 보인다.
+- **에러 케이스는 성공만큼 테스트한다.** HTTP 는 상태 코드(404/422/503)로, 함수·스키마는 `pytest.raises` 로 "예외가 나는 게 정상" 임을 단언한다.
+- **외부 호출은 모킹한다.** 외부 통신을 얇은 함수(`fetch_rate`)로 격리해 두는 **설계** 가 먼저다. 그 위에서 `monkeypatch`(함수 교체)·`dependency_overrides`(의존성 교체)·`httpx.MockTransport`(HTTP 레이어 교체) 셋 중 상황에 맞는 걸 고른다. 입문에서 가장 잦은 건 `monkeypatch`.
+- **조직화** 는 기능/주제 단위로 파일을 나누고, 클래스로 묶고, 이름을 사양처럼 짓는 것.
+- **커버리지(`pytest-cov`)** 는 빠뜨린 줄을 찾는 지도다. 선택 도구이며, 숫자 자체보다 의미 있는 단언이 먼저다.
+
+다음 챕터에서는 **파일 업로드**를 다룬다. 멀티파트 폼, 이미지 저장, 크기·확장자 검증 같은 실무 패턴을 배우고, 업로드 엔드포인트도 이 장에서 익힌 방식으로 테스트한다.
+
+---
+
+← [12. 유틸리티 및 라이브러리](12-utilities.md) | [README로 돌아가기](../README.md) | 다음 문서로 이동: **[14. 파일 업로드 →](14-file-upload.md)**
+
+<a id="ch14"></a>
+
+# 14. 파일 업로드 — UploadFile
+
+> **이 챕터의 목표**
+> - 클라이언트가 보낸 파일을 FastAPI 가 어떻게 받는지, `UploadFile` 과 `bytes` 의 차이를 분명히 안다.
+> - `File()` / `Form()` 로 파일과 일반 폼 필드를 함께 받는 멀티파트 요청을 다룬다.
+> - 업로드를 **검증**한다 — 확장자·콘텐츠 타입·크기 상한. 실패하면 400 / 413 으로 일관되게 거절한다.
+> - 클라이언트가 보낸 파일명을 절대 믿지 않고, **무작위 파일명**으로 안전하게 저장해 경로 traversal 을 막는다.
+> - 저장된 파일을 `FileResponse` 로 다시 내려준다.
+> - 메모리에 통째로 올리기 vs 디스크에 스트리밍하기의 트레이드오프를 손에 익힌다.
+> - `pytest` + `httpx.AsyncClient` 로 업로드/다운로드를 16개 케이스로 검증한다.
+
+> **소요 시간**: 2~3시간
+
+> **전제**: 05장에서 `UploadFile` 을 잠깐 봤다. FastAPI 한 줄 라우트, Pydantic, `Depends` 의존성 주입, `pytest` + `httpx.AsyncClient` 통합 테스트(07장)에 한 번씩 손을 대 봤다.
+
+> **모르는 단어가 나오면** [용어 사전(glossary.md)](glossary.md)을 펼쳐 한두 줄만 읽고 돌아오시면 됩니다.
+
+---
+
+## 14.1 파일 업로드는 왜 "조금 다른가"
+
+지금까지 우리가 받은 요청 본문은 모두 **JSON** 이었다. `{"title": "..."}` 같은 텍스트다. 그런데 파일은 다르다.
+
+- 이미지·PDF·동영상은 **바이너리**다. JSON 안에 그대로 넣을 수 없다.
+- 한 번에 수십 MB ~ 수백 MB 가 될 수 있다. 텍스트 본문처럼 가볍지 않다.
+- 보통 "파일 + 설명 텍스트" 를 **함께** 보낸다(예: 프로필 사진 + 닉네임).
+
+그래서 브라우저·HTTP 는 파일 전송에 `multipart/form-data` 라는 별도 형식을 쓴다. JSON(`application/json`) 이 아니다.
+
+> **`multipart/form-data` 가 뭔가요?** 하나의 요청 본문을 여러 "파트(part)" 로 나눠 담는 인코딩이다. 각 파트는 자기만의 헤더(파일명, 콘텐츠 타입)를 가진다. HTML `<form enctype="multipart/form-data">` 가 파일을 올릴 때 쓰는 바로 그 형식이다. 텍스트 필드와 파일을 한 본문에 섞어 보낼 수 있다.
+
+이번 장은 "할 일 API" 같은 CRUD 가 아니라, **파일 한 건을 받아 검증하고, 안전하게 저장하고, 다시 내려주는** 작은 서비스를 만든다.
+
+### 14.1.1 무엇을 만들 것인가
+
+엔드포인트 표:
+
+| 메서드 | 경로 | 설명 | 성공 상태 |
+|--------|------|------|-----------|
+| `POST` | `/files` | 단일 파일 업로드(검증 → 저장 → 메타 반환) | 201 Created |
+| `POST` | `/files/batch` | 다중 파일 업로드(+ 선택 폼 필드) | 201 Created |
+| `GET` | `/files/{file_id}` | 파일 다운로드 | 200 OK |
+| `GET` | `/health` | 헬스 체크 | 200 OK |
+
+검증 실패의 응답 약속:
+
+- 허용 안 된 확장자·콘텐츠 타입, 빈 파일 → **400 Bad Request**
+- 크기 상한 초과 → **413 Request Entity Too Large**(= Payload Too Large)
+- 없는 파일 다운로드 → **404 Not Found**
+
+이 챕터에서 새로 익힐 것은 다음 다섯 가지다.
+
+1. **`UploadFile`** 로 파일을 받고, `File()` / `Form()` 로 멀티파트 필드를 선언한다.
+2. **검증** — 확장자(화이트리스트), 콘텐츠 타입, 크기 상한을 코드로 강제한다.
+3. **안전한 저장** — 파일명을 무작위로 새로 만들어 경로 traversal 을 차단한다.
+4. **`FileResponse`** 로 저장된 파일을 원본 파일명으로 내려준다.
+5. **메모리 vs 디스크** 트레이드오프 — 큰 파일을 청크 스트리밍으로 다루는 패턴.
+
+---
+
+## 14.2 `python-multipart` — 왜 따로 깔아야 하나
+
+본격적인 코드 전에 의존성 하나를 먼저 짚는다. 파일 업로드 코드를 쓰기 전에 다음을 설치해야 한다.
+
+```bash
+uv add fastapi "uvicorn[standard]" python-multipart
+```
+
+`python-multipart` 가 빠지면, 파일을 받는 라우트가 있는 앱을 띄울 때 FastAPI 가 다음과 비슷한 에러를 던진다.
+
+```
+RuntimeError: Form data requires "python-multipart" to be installed.
+```
+
+> **왜 FastAPI 에 기본 포함이 아닌가요?** FastAPI(정확히는 그 아래의 Starlette)는 멀티파트 본문을 직접 파싱하지 않고, `python-multipart` 라는 별도 라이브러리에 맡긴다. JSON API 만 만드는 사람은 이 의존성이 필요 없으므로, "필요한 사람만 깐다" 는 방향으로 분리되어 있다. 우리는 파일을 받을 거라 반드시 깐다.
+
+이 예제의 `pyproject.toml` 핵심부는 다음과 같다(예제 폴더의 파일과 동일).
+
+```toml
+[project]
+name = "file-upload"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+이번 장은 DB 를 쓰지 않으므로(메타데이터는 메모리에 둔다) SQLAlchemy·Alembic·pydantic-settings 가 없다. 의존성이 07장보다 훨씬 가볍다.
+
+---
+
+## 14.3 폴더 구조 한 그림
+
+```
+14-FileUpload/
+├── pyproject.toml
+├── uv.lock                   (uv sync 후 생성)
+├── .python-version
+├── .gitignore                ← 업로드 산출물(uploads/) 무시
+├── README.md
+├── app/
+│   ├── __init__.py
+│   └── main.py               ← 앱 + 업로드/다운로드 라우트 + 검증/저장 로직
+└── tests/
+    ├── __init__.py
+    ├── conftest.py           ← 임시 저장 디렉터리 + 의존성 오버라이드
+    └── test_files.py
+```
+
+07장보다 단순하다. DB 가 없으니 `models.py` / `crud.py` / `alembic/` 이 없고, 핵심 로직이 `app/main.py` 한 파일에 모여 있다.
+
+> **`.gitignore` 에 업로드 폴더를 꼭 넣는다.** 업로드된 파일은 코드가 아니다. 사용자가 올린 산출물이라 git 에 들어가면 안 된다. 이 예제는 `uploads/` 와 `fastapi-uploads/` 를 무시한다.
+
+---
+
+## 14.4 `UploadFile` vs `bytes` — 무엇으로 받을까
+
+FastAPI 에서 파일을 받는 방법은 두 가지다.
+
+### 14.4.1 `bytes` 로 받기 — 통째로 메모리에
+
+```python
+from fastapi import FastAPI, File
+
+app = FastAPI()
+
+
+@app.post("/upload-bytes")
+async def upload_bytes(file: bytes = File(...)) -> dict:
+    # 이 시점에 파일 전체가 이미 메모리(RAM)에 올라와 있다.
+    return {"size": len(file)}
+```
+
+`file: bytes = File(...)` 라고 적으면, FastAPI 가 파일 전체를 읽어 **하나의 `bytes` 객체** 로 넘겨준다. 다루기는 가장 쉽다. 하지만 치명적인 단점이 있다.
+
+> **`bytes` 의 함정**: 100MB 파일을 올리면 그 100MB 가 통째로 RAM 에 올라온다. 동시에 열 명이 올리면 1GB. 큰 파일이나 동시 업로드가 있는 서비스에서는 메모리가 순식간에 터진다. **작은 파일이 확실할 때만** 쓴다.
+
+### 14.4.2 `UploadFile` 로 받기 — 파일 같은 객체
+
+```python
+from fastapi import FastAPI, UploadFile
+
+app = FastAPI()
+
+
+@app.post("/upload-file")
+async def upload_file(file: UploadFile) -> dict:
+    content = await file.read()      # 필요할 때 읽는다(청크 단위도 가능)
+    return {
+        "filename": file.filename,    # 원본 파일명
+        "content_type": file.content_type,  # MIME 타입
+        "size": len(content),
+    }
+```
+
+`UploadFile` 은 "파일처럼 생긴 객체" 다. 통째로 메모리에 올리는 대신, 내부적으로 **`SpooledTemporaryFile`** 을 쓴다. 작은 동안은 메모리에 있다가, 일정 크기를 넘으면 자동으로 디스크의 임시 파일로 넘어간다. 그래서 큰 파일도 메모리를 폭발시키지 않는다.
+
+`UploadFile` 이 주는 것:
+
+| 속성/메서드 | 설명 |
+|-------------|------|
+| `.filename` | 클라이언트가 보낸 원본 파일명(예: `photo.png`) |
+| `.content_type` | MIME 타입(예: `image/png`) |
+| `await .read(size)` | `size` 바이트만큼 읽는다. 인자 없으면 전부 |
+| `await .seek(offset)` | 읽기 위치 이동(예: 다시 처음부터) |
+| `await .close()` | 닫기 |
+
+> **결론: 거의 항상 `UploadFile`.** 메모리 안전성, 파일명·콘텐츠 타입 메타데이터, 청크 읽기 — 셋 다 `UploadFile` 만 준다. 이 장의 본 예제도 처음부터 끝까지 `UploadFile` 을 쓴다.
+
+> **왜 `File(...)` 을 안 붙여도 되나요?** 타입 힌트가 `UploadFile` 이면 FastAPI 가 "아, 이건 파일 파트구나" 를 자동으로 안다. `bytes` 의 경우엔 그냥 본문 전체로 오해할 수 있어 `File(...)` 을 명시한다. `UploadFile` 에도 `File(...)` 을 붙일 수 있고(설명·검증 메타를 달 때), 이 예제는 명시하는 쪽을 택한다.
+
+---
+
+## 14.5 `File()` 과 `Form()` — 멀티파트 한 본문에 파일과 텍스트를
+
+파일만 받는 일은 드물다. 보통 "파일 + 부가 정보(설명, 카테고리...)" 를 함께 받는다. 그런데 한 가지 규칙이 있다.
+
+> **멀티파트 요청에는 JSON 바디(`Pydantic` 모델)를 섞을 수 없다.** 한 요청은 `application/json` 이거나 `multipart/form-data` 이거나 둘 중 하나다. 파일을 받는 순간 그 요청은 멀티파트이고, 텍스트 필드도 **`Form()`** 으로 받아야 한다.
+
+```python
+from fastapi import FastAPI, File, Form, UploadFile
+
+app = FastAPI()
+
+
+@app.post("/profile")
+async def upload_profile(
+    nickname: str = Form(...),          # 텍스트 파트
+    bio: str | None = Form(default=None),
+    avatar: UploadFile = File(...),     # 파일 파트
+) -> dict:
+    return {"nickname": nickname, "bio": bio, "avatar": avatar.filename}
+```
+
+- **`Form(...)`** — 이 값은 JSON 바디가 아니라 멀티파트의 **텍스트 폼 필드** 에서 온다. `Field(...)` 처럼 기본값·검증을 달 수 있다.
+- **`File(...)`** — 파일 파트.
+
+> **`Form` 과 `Query` 는 뭐가 다른가요?** `Query` 는 URL 의 `?key=value` 에서 값을 읽고, `Form` 은 멀티파트/`urlencoded` **본문**의 폼 필드에서 읽는다. 둘 다 Pydantic 검증을 똑같이 받는다.
+
+---
+
+## 14.6 `app/main.py` — 설정과 검증 규칙
+
+이제 본 예제다. 위에서부터 한 조각씩 만든다. 먼저 import 와 **검증 규칙·저장 위치** 부터.
+
+```python
+# app/main.py
+from __future__ import annotations
+
+import secrets
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
+
+# 허용할 확장자(소문자, 점 포함). 화이트리스트 방식 — "허용한 것만 통과".
+ALLOWED_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".gif", ".pdf", ".txt"})
+
+# 허용할 콘텐츠 타입(MIME). 확장자와 함께 이중으로 점검한다.
+ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "application/pdf",
+        "text/plain",
+    }
+)
+
+# 업로드 크기 상한(바이트). 5 MiB.
+MAX_FILE_SIZE: int = 5 * 1024 * 1024
+
+# 한 번에 스트리밍으로 읽어들일 청크 크기(바이트). 64 KiB.
+CHUNK_SIZE: int = 64 * 1024
+```
+
+세 가지 검증 축을 상수로 못 박았다.
+
+1. **확장자 화이트리스트** — `.png`, `.pdf` 등 **허용할 것만** 모은 집합. 블랙리스트("이것만 막기")가 아니라 화이트리스트인 게 핵심이다.
+2. **콘텐츠 타입 화이트리스트** — `image/png` 등. 확장자와 별개로 한 번 더 본다.
+3. **크기 상한** — 5 MiB. 이걸 넘으면 413.
+
+> **왜 블랙리스트가 아니라 화이트리스트인가?** "위험한 것을 막는다"(블랙리스트)는 늘 빈틈이 생긴다. `.exe` 를 막아도 `.bat`, `.sh`, `.php` ... 끝이 없다. 반대로 "허용할 것만 통과"(화이트리스트)는 새로운 위협이 나와도 자동으로 막힌다. 보안의 기본 원칙이다.
+
+> **`frozenset` 을 쓴 이유**: 변하지 않는 집합이라 의도를 분명히 하고(실수로 추가 못 함), `in` 검사가 빠르다. 일반 `set` 이나 `tuple` 로 둬도 동작은 같다.
+
+### 14.6.1 저장 위치를 의존성으로 빼기
+
+```python
+def get_storage_dir() -> Path:
+    """업로드 파일을 저장할 디렉터리.
+
+    의존성으로 빼 두었다. 테스트에서는 app.dependency_overrides 로
+    이 함수를 임시 디렉터리를 돌려주는 함수로 갈아끼운다.
+    """
+    base = Path(tempfile.gettempdir()) / "fastapi-uploads"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+```
+
+저장 디렉터리를 **함수 하나로 빼서 의존성으로 만든** 게 이 예제의 작은 핵심이다. 이유는 07장에서 `get_session` 을 의존성으로 둔 것과 똑같다.
+
+- 운영에서는 OS 임시 폴더 아래 `fastapi-uploads/`(또는 환경 변수로 `./uploads`)를 쓴다.
+- **테스트에서는 `app.dependency_overrides[get_storage_dir]` 한 줄로** 매 테스트마다 깨끗한 임시 폴더로 갈아끼운다. 진짜 저장 폴더를 더럽히지 않는다.
+
+> **`tempfile.gettempdir()` 가 뭔가요?** OS 의 임시 디렉터리 경로를 돌려준다(리눅스 `/tmp`, macOS 의 `/var/folders/...` 등). 학습 예제의 기본 저장 위치로 적당하다. 운영에서는 재부팅에도 살아남는 고정 경로(`./uploads`, 또는 S3 같은 오브젝트 스토리지)를 쓴다.
+
+---
+
+## 14.7 메타데이터 저장소와 검증 헬퍼
+
+### 14.7.1 메타데이터 — 학습용 인메모리
+
+실제 파일은 디스크에 저장하고, "이 파일이 무엇인지"(원본 이름, 타입, 크기)는 따로 기록해야 다운로드할 때 찾을 수 있다. 이 메타데이터를 이번 장은 메모리 딕셔너리에 둔다.
+
+```python
+@dataclass
+class StoredFile:
+    """저장된 파일 한 건의 메타데이터."""
+
+    file_id: str
+    original_name: str
+    stored_name: str
+    content_type: str
+    size: int
+
+
+# file_id -> StoredFile
+_FILES: dict[str, StoredFile] = {}
+```
+
+> **실전에서는 이 자리에 DB 가 온다.** `_FILES` 딕셔너리는 학습을 위해 단순화한 것이다. 서버를 재시작하면 사라지고, 여러 워커로 띄우면 공유도 안 된다. 실무에서는 6·7장의 SQLAlchemy 모델(`files` 표)로 이 메타데이터를 영속화한다. 구조는 똑같다 — "파일은 스토리지에, 메타는 DB 에".
+
+### 14.7.2 검증 헬퍼
+
+파일을 읽기 **전에** 확장자와 콘텐츠 타입을 먼저 본다. 큰 파일을 다 읽고 나서 거절하면 자원 낭비다.
+
+```python
+def _extension_of(filename: str | None) -> str:
+    """파일명에서 소문자 확장자를 뽑는다. 없으면 빈 문자열."""
+    if not filename:
+        return ""
+    return Path(filename).suffix.lower()
+
+
+def _validate_metadata(upload: UploadFile) -> str:
+    """파일을 읽기 전에 확장자/콘텐츠 타입을 먼저 점검한다.
+
+    통과하면 확장자를 돌려주고, 실패하면 400 을 던진다.
+    """
+    ext = _extension_of(upload.filename)
+    if ext not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"허용되지 않은 확장자입니다: '{ext or '(없음)'}'. 허용: {allowed}",
+        )
+    if upload.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"허용되지 않은 콘텐츠 타입입니다: '{upload.content_type}'",
+        )
+    return ext
+```
+
+- **`Path(filename).suffix.lower()`** — `pathlib` 로 확장자를 뽑고 소문자로 통일한다. `PHOTO.PNG` 도 `.png` 로 본다.
+- 확장자가 화이트리스트에 없으면 **400**. 콘텐츠 타입도 마찬가지.
+
+> **확장자와 콘텐츠 타입을 둘 다 보는 이유**: 어느 쪽도 100% 믿을 수 없기 때문이다. 클라이언트는 `.png` 확장자에 아무 콘텐츠 타입이나 붙여 보낼 수 있고, 반대도 된다. 둘 다 화이트리스트로 걸러 **둘 다 통과한 것만** 받는다. (정말 엄격하게 하려면 파일의 첫 바이트(매직 넘버)까지 보는 방법도 있지만, 이 장의 범위는 넘는다.)
+
+---
+
+## 14.8 핵심 — 검증하며 디스크로 스트리밍 저장
+
+이 절이 이 챕터에서 **가장 중요한 함수**다. 검증, 무작위 파일명, 청크 스트리밍, 크기 상한이 한 곳에 모인다.
+
+```python
+async def _save_upload(upload: UploadFile, storage_dir: Path) -> StoredFile:
+    """검증 → 무작위 파일명으로 디스크에 스트리밍 저장 → 메타 반환.
+
+    핵심 두 가지:
+    1. 파일명을 secrets.token_hex 로 새로 만든다. 클라이언트가 보낸 원본
+       파일명(../../etc/passwd 같은)을 경로에 절대 쓰지 않는다 → 경로 traversal 차단.
+    2. 청크 단위로 읽으며 누적 크기를 센다. 상한을 넘는 순간 끊고 413 을 던진다.
+       파일 전체를 메모리에 올리지 않으므로 큰 파일도 안전하다.
+    """
+    ext = _validate_metadata(upload)
+
+    # 무작위 파일명. 원본 이름은 메타로만 보관한다.
+    stored_name = f"{secrets.token_hex(16)}{ext}"
+    dest = storage_dir / stored_name
+
+    size = 0
+    try:
+        with dest.open("wb") as buffer:
+            while chunk := await upload.read(CHUNK_SIZE):
+                size += len(chunk)
+                if size > MAX_FILE_SIZE:
+                    # 여기까지 쓴 부분 파일은 지운다.
+                    buffer.close()
+                    dest.unlink(missing_ok=True)
+                    # 413 Payload Too Large. Starlette 버전에 따라 상태 상수 이름이
+                    # 달라(REQUEST_ENTITY_TOO_LARGE → CONTENT_TOO_LARGE) 정수 413 을 직접 쓴다.
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"파일이 너무 큽니다. 최대 {MAX_FILE_SIZE} 바이트까지 허용됩니다.",
+                    )
+                buffer.write(chunk)
+    finally:
+        await upload.close()
+
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="빈 파일은 업로드할 수 없습니다.",
+        )
+
+    file_id = secrets.token_urlsafe(16)
+    record = StoredFile(
+        file_id=file_id,
+        original_name=upload.filename or stored_name,
+        stored_name=stored_name,
+        content_type=upload.content_type or "application/octet-stream",
+        size=size,
+    )
+    _FILES[file_id] = record
+    return record
+```
+
+한 줄씩 뜯어 보자.
+
+### 14.8.1 무작위 파일명으로 경로 traversal 차단
+
+```python
+stored_name = f"{secrets.token_hex(16)}{ext}"
+dest = storage_dir / stored_name
+```
+
+**이것이 이 장의 가장 중요한 보안 한 줄이다.** 클라이언트가 보낸 `upload.filename` 을 디스크 경로에 **절대 그대로 쓰지 않는다**. 대신 `secrets.token_hex(16)` 으로 무작위 이름을 새로 만든다(확장자만 보존).
+
+> **경로 traversal(path traversal) 공격이 뭔가요?** 공격자가 파일명에 `../../etc/passwd` 같은 상대 경로를 넣어, 저장 폴더 **바깥**의 파일을 덮어쓰거나 읽으려는 시도다. 만약 우리가 `storage_dir / upload.filename` 처럼 원본 이름을 그대로 이어 붙였다면, `..` 가 상위 폴더로 빠져나가 시스템 파일을 건드릴 수 있다. **무작위 이름으로 새로 지으면** 이 공격이 원천 봉쇄된다 — 공격자가 보낸 이름은 경로에 한 글자도 안 들어가니까.
+
+> **`secrets` vs `random` vs `uuid`**: `secrets` 는 암호학적으로 안전한 난수다. 추측 불가능한 식별자가 필요할 때 쓴다. `random` 은 예측 가능할 수 있어 보안 용도엔 부적합하다. `uuid.uuid4()` 도 좋은 선택지다 — 여기서는 `secrets.token_hex`(파일명용)와 `secrets.token_urlsafe`(URL 에 들어갈 file_id 용)를 썼다.
+
+### 14.8.2 청크 스트리밍 + 크기 상한
+
+```python
+while chunk := await upload.read(CHUNK_SIZE):
+    size += len(chunk)
+    if size > MAX_FILE_SIZE:
+        ...
+        raise HTTPException(status_code=413, ...)
+    buffer.write(chunk)
+```
+
+`await upload.read(CHUNK_SIZE)` 는 한 번에 64KiB 만 읽는다. 그걸 즉시 디스크에 쓰고, 다음 청크를 읽는다. **파일 전체를 메모리에 올리지 않는다.** 100MB 파일이 와도 메모리에는 한 번에 64KiB 만 있다.
+
+- `:=` 는 "월러스 연산자". `chunk` 에 읽은 값을 대입하면서 동시에 조건으로 쓴다. 더 읽을 게 없으면 `read` 가 빈 바이트(`b""`)를 돌려주고, 그게 거짓이라 루프가 끝난다.
+- **누적 크기가 상한을 넘는 순간** 즉시 끊고, 여기까지 쓴 부분 파일을 지운 뒤 **413** 을 던진다.
+
+> **왜 `Content-Length` 헤더만 믿지 않나요?** 클라이언트가 보낸 `Content-Length` 헤더는 거짓일 수 있다. "10바이트"라고 적고 1GB 를 보낼 수도 있다. 그래서 **실제로 읽으며 센 바이트** 를 기준으로 끊는 게 안전하다. 헤더는 참고용일 뿐이다.
+
+> **413 상태 코드를 왜 정수로 직접 썼나요?** Starlette 버전에 따라 상수 이름이 `HTTP_413_REQUEST_ENTITY_TOO_LARGE` 에서 `HTTP_413_CONTENT_TOO_LARGE` 로 바뀌었다(둘 다 값은 413). 버전 호환을 위해 이 한 곳만 정수 `413` 을 직접 적었다. 나머지 상태 코드는 `status.HTTP_*` 상수를 그대로 쓴다.
+
+### 14.8.3 `try/finally` 로 항상 닫기
+
+```python
+try:
+    with dest.open("wb") as buffer:
+        ...
+finally:
+    await upload.close()
+```
+
+검증에 실패해 예외가 나든, 정상으로 끝나든, **`upload.close()` 를 반드시 부른다**. `UploadFile` 은 내부적으로 임시 파일 자원을 들고 있을 수 있어, 닫아 주는 게 깔끔하다. `with` 블록은 디스크 파일(`buffer`)을 자동으로 닫는다.
+
+### 14.8.4 빈 파일 거절
+
+```python
+if size == 0:
+    dest.unlink(missing_ok=True)
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="빈 파일은 ...")
+```
+
+0바이트 파일은 보통 실수(또는 장난)다. 빈 파일을 만들어 두고 400 으로 거절한다. `dest.unlink(missing_ok=True)` 로 방금 만든 0바이트 파일을 지운다.
+
+---
+
+## 14.9 응답 메타와 앱·라우트
+
+### 14.9.1 응답으로 내보낼 메타
+
+```python
+def _to_meta(record: StoredFile) -> dict:
+    """응답으로 내보낼 메타데이터 dict. 내부 저장 파일명은 노출하지 않는다."""
+    return {
+        "file_id": record.file_id,
+        "filename": record.original_name,
+        "content_type": record.content_type,
+        "size": record.size,
+    }
+```
+
+응답에는 **`stored_name`(내부 무작위 파일명)을 넣지 않는다.** 클라이언트는 `file_id` 만 알면 되고, 서버의 실제 저장 파일명은 내부 구현이라 숨긴다. (보안과 캡슐화 둘 다를 위해.)
+
+### 14.9.2 앱과 업로드 라우트
+
+```python
+app = FastAPI(
+    title="File Upload API",
+    version="0.1.0",
+    description="14장 파일 업로드 예제 — UploadFile, 검증, 안전한 저장, FileResponse 다운로드.",
+)
+
+
+@app.get("/health", tags=["meta"], summary="헬스 체크")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post(
+    "/files",
+    status_code=status.HTTP_201_CREATED,
+    tags=["files"],
+    summary="단일 파일 업로드",
+)
+async def upload_file(
+    file: UploadFile = File(..., description="업로드할 파일"),
+    storage_dir: Path = Depends(get_storage_dir),
+) -> dict:
+    """파일 한 건을 받아 검증 후 저장하고 메타데이터를 돌려준다.
+
+    - 허용 안 된 확장자/콘텐츠 타입 → 400
+    - 크기 상한 초과 → 413
+    """
+    record = await _save_upload(file, storage_dir)
+    return _to_meta(record)
+```
+
+- **`status_code=status.HTTP_201_CREATED`** — 새 자원(파일)이 만들어졌으니 201. 07장에서 익힌 규칙 그대로다.
+- **`storage_dir: Path = Depends(get_storage_dir)`** — 저장 디렉터리를 의존성으로 주입받는다. 라우터는 "어디에 저장할지" 를 직접 모른다. 그래서 테스트에서 갈아끼울 수 있다.
+- 라우터는 **HTTP 처리만** 하고, 검증·저장의 세부는 `_save_upload` 에 위임한다(07장의 "라우터는 HTTP, 로직은 분리" 정신).
+
+### 14.9.3 다중 업로드 + 폼 필드
+
+```python
+@app.post(
+    "/files/batch",
+    status_code=status.HTTP_201_CREATED,
+    tags=["files"],
+    summary="다중 파일 업로드",
+)
+async def upload_files(
+    files: list[UploadFile] = File(..., description="업로드할 파일들"),
+    note: str | None = Form(default=None, description="선택 메모(폼 필드)"),
+    storage_dir: Path = Depends(get_storage_dir),
+) -> dict:
+    """여러 파일을 한 번에 받는다. Form 필드와 파일을 같이 받는 예시도 겸한다."""
+    saved = [_to_meta(await _save_upload(f, storage_dir)) for f in files]
+    return {"count": len(saved), "items": saved, "note": note}
+```
+
+- **`files: list[UploadFile]`** — 같은 필드명(`files`)으로 여러 파일을 받으면 리스트가 된다. 단일과 다중의 차이는 타입 힌트 한 글자(`list[...]`)뿐이다.
+- **`note: str | None = Form(default=None)`** — 파일과 함께 일반 텍스트 필드를 받는다. 멀티파트 요청이라 `Form()` 으로 받는다.
+
+> **다중 업로드에서 하나가 실패하면?** 이 예제는 리스트 컴프리헨션 안에서 순서대로 저장하다가, 하나라도 검증에 실패하면 그 자리에서 예외가 올라가 400/413 으로 끊긴다. 앞에서 이미 저장된 파일은 디스크에 남을 수 있다 — 학습 예제라 단순하게 뒀다. 실무에서는 "전부 검증 먼저 → 전부 저장" 2단계로 나누거나, 실패 시 앞선 파일을 정리하는 로직을 더한다.
+
+---
+
+## 14.10 `FileResponse` — 파일 다운로드
+
+저장한 파일을 다시 내려주는 라우트다.
+
+```python
+@app.get(
+    "/files/{file_id}",
+    tags=["files"],
+    summary="파일 다운로드",
+)
+async def download_file(
+    file_id: str,
+    storage_dir: Path = Depends(get_storage_dir),
+) -> FileResponse:
+    """저장된 파일을 원본 파일명으로 내려준다.
+
+    경로 파라미터로는 무작위 file_id 만 받는다. 실제 디스크 경로는 서버가
+    메타데이터에서 찾아 구성하므로, 클라이언트가 경로를 조작할 수 없다.
+    """
+    record = _FILES.get(file_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"파일 {file_id} 를 찾을 수 없습니다.",
+        )
+
+    path = storage_dir / record.stored_name
+    if not path.exists():
+        # 메타는 있는데 실제 파일이 사라진 경우(직접 삭제 등).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="저장된 파일을 디스크에서 찾을 수 없습니다.",
+        )
+
+    return FileResponse(
+        path=path,
+        media_type=record.content_type,
+        filename=record.original_name,
+    )
+```
+
+### 14.10.1 `FileResponse` 가 해 주는 것
+
+`FileResponse` 는 디스크의 파일을 효율적으로 내려주는 전용 응답 클래스다.
+
+- 파일을 **청크 단위로 스트리밍** 한다. 통째로 메모리에 안 올린다(업로드와 대칭).
+- `media_type` — 응답의 `Content-Type` 헤더.
+- `filename` — 이걸 주면 `Content-Disposition: attachment; filename="..."` 헤더가 붙어, 브라우저가 그 이름으로 **다운로드** 한다.
+
+> **`Content-Disposition` 헤더가 뭔가요?** "이 응답을 브라우저에 그려라(inline) vs 파일로 저장해라(attachment)" 를 정하는 헤더다. `FileResponse(filename=...)` 는 `attachment` 로 붙여, 클릭하면 다운로드되게 한다. 원본 파일명을 여기에 실어 보낸다.
+
+### 14.10.2 file_id 만 받는 게 또 하나의 보안 장치
+
+경로 파라미터로 **무작위 `file_id`** 만 받는다는 점이 중요하다. 만약 `GET /files/{경로}` 식으로 클라이언트가 파일 경로를 직접 넘기게 했다면, 또 경로 traversal 위험이 생긴다. 우리는 클라이언트가 추측 불가능한 `file_id` 만 알고, 실제 디스크 경로는 **서버가 메타데이터에서 찾아 구성** 한다. 클라이언트가 경로를 조작할 여지가 없다.
+
+> **메타는 있는데 파일이 없으면?** 누군가 디스크에서 파일만 지웠을 수 있다. `path.exists()` 로 한 번 더 확인하고, 없으면 404 를 돌려준다. 메타와 실제 파일의 불일치를 우아하게 처리한다.
+
+---
+
+## 14.11 `tests/conftest.py` — 임시 저장 디렉터리 주입
+
+07장에서 `get_session` 을 메모리 DB 로 갈아끼웠듯, 여기서는 `get_storage_dir` 을 **매 테스트마다 새 임시 폴더** 로 갈아끼운다.
+
+```python
+# tests/conftest.py
+from collections.abc import AsyncGenerator
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app.main import _FILES, app, get_storage_dir
+
+
+@pytest_asyncio.fixture
+async def client(tmp_path: Path) -> AsyncGenerator[AsyncClient, None]:
+    """의존성 오버라이드된 비동기 HTTP 클라이언트.
+
+    tmp_path 는 pytest 가 매 테스트마다 만들어 주는 고유한 임시 디렉터리다.
+    그 안에 uploads/ 를 만들어 저장 경로로 주입한다.
+    """
+    storage_dir = tmp_path / "uploads"
+    storage_dir.mkdir()
+
+    def override_storage_dir() -> Path:
+        return storage_dir
+
+    # 앱의 저장 경로 의존성을 테스트용 임시 폴더로 교체.
+    app.dependency_overrides[get_storage_dir] = override_storage_dir
+    # 인메모리 메타데이터도 매 테스트마다 비워 격리한다.
+    _FILES.clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
+    _FILES.clear()
+
+
+@pytest.fixture
+def png_bytes() -> bytes:
+    """아주 작은 유효한 PNG(1x1) 바이트."""
+    return (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01"
+        b"\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+```
+
+핵심을 짚자.
+
+> **`tmp_path` 가 뭔가요?** pytest 가 기본 제공하는 fixture 다. 테스트 함수마다 **고유한 임시 디렉터리**(`Path` 객체)를 만들어 주고, 테스트가 끝나면 알아서 정리한다. 우리는 그 안에 `uploads/` 를 만들어 저장 경로로 주입한다. 매 테스트가 자기만의 폴더를 쓰므로 완벽히 격리된다.
+
+- **`app.dependency_overrides[get_storage_dir] = override_storage_dir`** — 07장의 `get_session` 오버라이드와 똑같은 패턴. 앱 코드는 한 글자도 안 바꾸고 저장 위치만 테스트용으로 바꾼다.
+- **`_FILES.clear()`** — 인메모리 메타데이터는 모듈 전역이라 테스트 간에 샐 수 있다. 시작·끝에 비워서 격리한다. (실전처럼 DB 였다면 DB fixture 가 이 역할을 했을 것이다.)
+- **`png_bytes` fixture** — 진짜 PNG 헤더를 가진 1x1 이미지 바이트. 콘텐츠 자체를 검증하진 않지만, 실제 파일처럼 다뤄 본다.
+
+> **httpx 로 파일을 어떻게 보내나요?** `client.post(url, files={"필드명": (파일명, 바이트, 콘텐츠타입)})` 형식이다. httpx 가 이 인자를 보면 자동으로 `multipart/form-data` 요청을 만든다. 폼 필드는 `data={"note": "..."}` 로 함께 보낸다.
+
+---
+
+## 14.12 `tests/test_files.py` — 16개 케이스
+
+테스트 함수 이름이 곧 사양이다. 주요 케이스를 보자(전체는 예제 폴더의 `tests/test_files.py`).
+
+```python
+# tests/test_files.py 일부
+from httpx import AsyncClient
+
+from app.main import MAX_FILE_SIZE
+
+
+class TestUploadFile:
+    async def test_정상_업로드는_201_과_메타데이터를_돌려준다(
+        self, client: AsyncClient, png_bytes: bytes
+    ) -> None:
+        res = await client.post(
+            "/files",
+            files={"file": ("photo.png", png_bytes, "image/png")},
+        )
+        assert res.status_code == 201
+        body = res.json()
+        assert body["filename"] == "photo.png"
+        assert body["size"] == len(png_bytes)
+        assert body["file_id"]
+
+    async def test_너무_큰_파일은_413(self, client: AsyncClient) -> None:
+        big = b"a" * (MAX_FILE_SIZE + 1)
+        res = await client.post(
+            "/files",
+            files={"file": ("big.txt", big, "text/plain")},
+        )
+        assert res.status_code == 413
+
+
+class TestPathTraversalSafety:
+    async def test_경로_조작_파일명도_안전하게_저장된다(
+        self, client: AsyncClient, png_bytes: bytes
+    ) -> None:
+        # 원본 파일명에 경로 조작 시도가 들어와도 무작위 이름으로 저장된다.
+        res = await client.post(
+            "/files",
+            files={"file": ("../../etc/passwd.png", png_bytes, "image/png")},
+        )
+        assert res.status_code == 201
+        # 다운로드가 정상 동작한다 = 경로가 깨지지 않았다는 증거.
+        file_id = res.json()["file_id"]
+        dl = await client.get(f"/files/{file_id}")
+        assert dl.status_code == 200
+        assert dl.content == png_bytes
+        assert "passwd.png" in dl.headers.get("content-disposition", "")
+```
+
+전체 16개 케이스 목록:
+
+1. 헬스 체크가 OK 를 돌려준다.
+2. 정상 업로드는 201 과 메타데이터.
+3. 텍스트 파일도 업로드된다.
+4. 허용 안 된 확장자는 400.
+5. 허용 안 된 콘텐츠 타입은 400.
+6. 너무 큰 파일은 413.
+7. 상한 경계 크기(정확히 `MAX_FILE_SIZE`)는 정상 저장된다.
+8. 빈 파일은 400.
+9. 확장자가 없으면 400.
+10. 경로 조작 파일명도 안전하게 저장된다(다운로드까지 검증).
+11. 다중 업로드는 여러 건을 저장한다.
+12. 폼 필드(`note`)를 파일과 함께 받는다.
+13. 다중 업로드 중 하나라도 검증 실패면 400.
+14. 업로드한 파일을 그대로 다운로드한다(바이트 일치 + Content-Disposition).
+15. 없는 id 다운로드는 404.
+16. 업로드 → 다운로드 전체 흐름.
+
+> **경계 케이스(7번)를 꼭 넣자.** "상한보다 1바이트 큰 건 거절(6번)" 과 "상한 정확히 같은 건 통과(7번)" 를 한 쌍으로 둔다. `>` 인지 `>=` 인지 같은 off-by-one 실수를 이 한 쌍이 잡아준다.
+
+### 14.12.1 실행
+
+```bash
+uv run pytest -q
+```
+
+성공하면 다음과 비슷한 출력이 나온다.
+
+```
+................                                                         [100%]
+16 passed in 0.08s
+```
+
+매 테스트가 자기만의 임시 폴더 위에서 돌고, 시작·끝에 `_FILES` 를 비우므로 **순서에 의존하지 않는다**.
+
+---
+
+## 14.13 서버 띄우고 직접 호출해 보기
+
+```bash
+uv run uvicorn app.main:app --reload
+```
+
+### 14.13.1 업로드
+
+```bash
+curl -F "file=@./photo.png" http://127.0.0.1:8000/files
+```
+
+응답(201):
+
+```json
+{
+  "file_id": "x3aB7...무작위...",
+  "filename": "photo.png",
+  "content_type": "image/png",
+  "size": 12345
+}
+```
+
+### 14.13.2 허용 안 된 확장자
+
+```bash
+curl -i -F "file=@./script.exe" http://127.0.0.1:8000/files
+```
+
+응답(400):
+
+```json
+{ "detail": "허용되지 않은 확장자입니다: '.exe'. 허용: .gif, .jpeg, .jpg, .pdf, .png, .txt" }
+```
+
+### 14.13.3 다운로드
+
+```bash
+# 위에서 받은 file_id 로. -OJ 는 서버가 준 파일명으로 저장.
+curl -OJ http://127.0.0.1:8000/files/<file_id>
+```
+
+원본 파일명(`photo.png`)으로 파일이 저장된다.
+
+### 14.13.4 자동 문서로 한 번 더
+
+브라우저에서 `http://127.0.0.1:8000/docs` 를 열면, `/files` 라우트에 **파일 선택 버튼이 달린 폼**이 자동으로 생긴다. `UploadFile` 타입을 보고 FastAPI 가 알아서 만들어 준 것이다. "Try it out" 으로 파일을 골라 바로 업로드해 볼 수 있다.
+
+---
+
+## 14.14 메모리 vs 디스크 — 트레이드오프 정리
+
+이 장 내내 "메모리에 통째로 올리지 말고 스트리밍하라" 고 했다. 표로 정리한다.
+
+| | `bytes = File(...)` (메모리) | `UploadFile` + 청크 스트리밍 (디스크) |
+|---|---|---|
+| 코드 단순함 | 가장 단순 | 약간 더 복잡 |
+| 작은 파일(수십 KB) | 충분히 OK | OK |
+| 큰 파일(수십~수백 MB) | **위험**(RAM 폭발) | 안전 |
+| 동시 업로드 다수 | **위험** | 안전 |
+| 크기 제한 | 다 읽고 나서야 앎 | 읽는 도중 끊을 수 있음 |
+| 파일명/메타데이터 | 없음 | `.filename`, `.content_type` |
+
+> **그럼 항상 디스크 스트리밍인가요?** 원칙적으로 그렇다. 다만 "썸네일처럼 작은 게 확실하고, 받자마자 메모리에서 변환만 하고 버린다" 같은 경우엔 `await file.read()` 로 한 번에 읽어도 괜찮다. 중요한 건 **무제한으로 메모리에 올리지 않는다** 는 감각이다.
+
+### 14.14.1 한 단계 더 — 큰 파일과 스토리지
+
+이 예제의 다음 진화 방향을 짧게만 짚는다(이 장의 범위는 아니다).
+
+- **오브젝트 스토리지** — 운영에서는 로컬 디스크 대신 S3 / GCS 같은 오브젝트 스토리지에 올리고, 서버는 메타데이터(+ 스토리지 키)만 DB 에 남긴다.
+- **업로드 직후 후처리** — 썸네일 생성, 바이러스 검사 같은 무거운 작업은 응답을 막지 않도록 **백그라운드 작업**으로 넘긴다. 바로 다음 15장의 주제다.
+
+---
+
+## 14.15 흔한 실수 / 트러블슈팅
+
+### 14.15.1 `RuntimeError: Form data requires "python-multipart" to be installed.`
+
+파일/폼을 받는 라우트가 있는데 `python-multipart` 가 안 깔렸다. `uv add python-multipart` 로 설치한다(14.2 절).
+
+### 14.15.2 `415 Unsupported Media Type` 또는 본문이 안 들어옴
+
+클라이언트가 `multipart/form-data` 가 아니라 JSON 으로 보냈을 때 흔하다. 파일 업로드는 멀티파트여야 한다. curl 은 `-F`(폼), httpx 는 `files=`/`data=` 를 쓴다. `-d '{...}'`(JSON)로 보내면 안 된다.
+
+### 14.15.3 큰 파일을 올리면 메모리가 치솟는다
+
+`file: bytes = File(...)` 로 받고 있을 가능성이 높다. `UploadFile` 로 바꾸고, `await file.read(CHUNK_SIZE)` 청크 루프로 디스크에 쓰자(14.8 절).
+
+### 14.15.4 두 번째로 `read()` 하면 빈 바이트가 나온다
+
+`UploadFile` 은 한 번 끝까지 읽으면 커서가 끝에 있다. 다시 읽으려면 `await file.seek(0)` 로 되감는다. (이 예제는 한 번만 읽으므로 해당 없음.)
+
+### 14.15.5 다운로드한 파일이 깨진다
+
+`FileResponse` 의 `media_type` 이 실제 파일과 다르거나, 업로드 저장 때 텍스트 모드로 열어(`"w"`) 바이너리가 깨졌을 수 있다. 저장은 반드시 **바이너리 모드(`"wb"`)** 로 연다(14.8 절).
+
+### 14.15.6 클라이언트 파일명을 그대로 저장하고 있다
+
+**가장 위험한 실수다.** `storage_dir / upload.filename` 처럼 원본 파일명을 경로에 쓰면 경로 traversal 에 노출된다. 무작위 파일명(`secrets.token_hex(...)`)으로 새로 지어 저장하자(14.8.1 절).
+
+### 14.15.7 테스트가 실제 폴더를 더럽힌다
+
+`get_storage_dir` 을 의존성으로 빼지 않았거나, 테스트에서 오버라이드하지 않았을 때다. `app.dependency_overrides[get_storage_dir]` 로 `tmp_path` 기반 폴더를 주입하자(14.11 절).
+
+### 14.15.8 413 상태 코드 상수가 없다는 에러
+
+Starlette 버전에 따라 `status.HTTP_413_REQUEST_ENTITY_TOO_LARGE` 또는 `status.HTTP_413_CONTENT_TOO_LARGE` 다. 버전에 상관없이 안전하게 하려면 이 한 곳만 정수 `413` 을 직접 쓴다(14.8.2 절).
+
+---
+
+## 14.16 이 챕터 요약
+
+- 파일은 JSON 이 아니라 **`multipart/form-data`** 로 온다. 그래서 `python-multipart` 가 필요하고, 텍스트 필드는 `Form()`, 파일은 `UploadFile`/`File()` 로 받는다.
+- **`UploadFile` 을 기본으로 쓴다.** 메모리 안전(청크 스트리밍), 파일명·콘텐츠 타입 메타, `seek`/`read` 를 모두 준다. `bytes` 는 작은 파일이 확실할 때만.
+- **검증 세 축**: 확장자 화이트리스트, 콘텐츠 타입 화이트리스트, 크기 상한. 실패는 400(형식)·413(크기)으로 일관되게.
+- **보안의 핵심 한 줄**: 클라이언트 파일명을 절대 경로에 쓰지 말고 `secrets` 로 무작위 이름을 새로 지어라. 경로 traversal 을 원천 차단한다.
+- **크기 제한은 실제로 읽으며 센 바이트로** 끊는다. `Content-Length` 헤더는 못 믿는다.
+- **다운로드는 `FileResponse(path, media_type, filename)`**. `filename` 을 주면 원본 이름으로 내려받게 된다. 클라이언트는 무작위 `file_id` 만 알고, 실제 경로는 서버가 메타에서 구성한다.
+- **테스트**는 `get_storage_dir` 을 `tmp_path` 폴더로 오버라이드해 격리한다. 07장의 `get_session` 오버라이드와 같은 패턴이다. httpx 는 `files=`/`data=` 로 멀티파트를 보낸다.
+- 메타데이터는 이 예제에서 메모리에 뒀지만, 실전에서는 **DB(스토리지엔 파일, DB엔 메타)** 로 영속화한다.
+
+다음 챕터에서는 업로드 직후의 썸네일 생성·이메일 발송 같은 **무거운 후처리를 응답을 막지 않고 처리하는 백그라운드 작업**을 다룬다.
+
+---
+
+← [13. 테스트 작성 심화](13-testing-deep.md) | [README로 돌아가기](../README.md) | 다음 문서로 이동: **[15. 백그라운드 작업 →](15-background-tasks.md)**
+
+<a id="ch15"></a>
+
+# 15. 백그라운드 작업 — BackgroundTasks
+
+> **이 챕터의 목표**
+> - **응답을 먼저 보내고, 무거운 부수 작업은 그 뒤에서** 실행하는 흐름을 자기 말로 설명할 수 있다.
+> - FastAPI의 `BackgroundTasks`를 라우터 파라미터로 받아 `add_task(...)`로 작업을 등록한다.
+> - `BackgroundTasks`를 **의존성으로 주입**받아, 라우터마다 반복되는 공통 작업을 한곳에 모은다.
+> - 한 요청에 **여러 작업을 등록**하고, 실행 순서를 이해한다.
+> - 작업 함수를 안전하게 설계한다 — **예외 처리**(실패해도 다른 작업·요청에 영향 없게)와 **멱등성**(두 번 실행돼도 안전하게).
+> - **동기(`def`)와 비동기(`async def`) 작업 함수**의 차이를 안다.
+> - `BackgroundTasks`의 **한계**(같은 프로세스·요청 수명에 묶임)를 분명히 이해하고, 무겁거나 재시도가 필요한 일은 Celery·RQ·arq 같은 외부 큐로 넘겨야 한다는 판단 기준을 세운다.
+
+> **모르는 단어가 나오면** [용어 사전(glossary.md)](glossary.md)을 펼쳐 한두 줄만 읽고 돌아오세요. 이 챕터에서 처음 등장하는 용어 대부분은 본문 흐름에서도 한 줄 정의로 함께 풀어 적습니다.
+
+> **소요 시간**: 1.5~2.5시간
+
+> **전제**: 05장(라우팅·요청/응답)과 07장(라우터 분리·`Depends` 의존성)을 읽었다. `@app.post(...)`, Pydantic 요청/응답 스키마, `Depends(...)`의 모양을 한 번씩 만나봤다.
+
+---
+
+## 15.1 왜 백그라운드 작업인가
+
+웹 API를 만들다 보면, "요청을 처리하긴 했는데 **응답과 직접 상관없는 뒷일**이 남는" 경우를 자주 만난다.
+
+- 회원가입을 받았다 → 가입 자체는 끝났는데, **환영 이메일**을 보내야 한다.
+- 글을 저장했다 → 저장은 끝났는데, **검색 인덱스를 갱신**해야 한다.
+- 파일을 업로드받았다 → 받긴 했는데, **썸네일을 만들어야** 한다.
+- 어떤 동작이 일어났다 → 본 처리는 끝났는데, **감사 로그**를 한 줄 남겨야 한다.
+
+이 뒷일들의 공통점은 **"클라이언트는 그 결과를 굳이 기다릴 필요가 없다"** 는 것이다. 가입한 사람은 "가입됐습니다" 라는 응답만 빨리 받으면 충분하다. 환영 이메일이 0.3초 뒤에 가든 2초 뒤에 가든 상관없다.
+
+그런데 이 뒷일을 라우터 안에서 그냥 `await send_email(...)` 처럼 처리하면, **클라이언트가 그 시간만큼 더 기다리게 된다**. 이메일 서버가 느리면 응답도 같이 느려진다. 사용자 입장에서는 "가입 버튼을 눌렀는데 한참 멈춰 있다" 가 된다.
+
+**백그라운드 작업**은 이 문제를 단순하게 푼다.
+
+> **백그라운드 작업이란?** "응답을 먼저 클라이언트에게 돌려보낸 뒤, 그 다음에 실행되는 일" 이다. 클라이언트는 빠르게 응답을 받고, 서버는 그 뒤에서 남은 일을 처리한다.
+
+FastAPI는 이걸 위한 가장 가벼운 도구로 `BackgroundTasks`를 기본 제공한다. 별도 라이브러리도, 별도 서버도 필요 없다.
+
+```python
+@app.post("/signup")
+async def signup(payload: SignupRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(send_welcome_email, payload.email)
+    return {"status": "registered"}   # ← 이 응답이 먼저 나간다
+    # send_welcome_email 은 응답이 전송된 "뒤"에 실행된다
+```
+
+이 한 챕터에서 우리는 이 도구를 끝까지 다룬다. 그리고 **이 도구로 충분한 경우와, 더 큰 도구(외부 큐)가 필요한 경우의 경계선**을 분명히 긋는다. 경계선을 아는 것이 이 챕터의 진짜 목표다.
+
+---
+
+## 15.2 실행 순서를 그림으로
+
+가장 헷갈리는 부분이 "그래서 정확히 **언제** 실행되는가" 이다. 시간 순으로 그려 보자.
+
+일반 라우터(백그라운드 없음):
+
+```
+클라이언트 ──요청──▶ [ 라우터: 가입 처리 + 이메일 발송(2초) ] ──응답──▶ 클라이언트
+                     └──────────── 2초 넘게 기다림 ────────────┘
+```
+
+`BackgroundTasks` 사용:
+
+```
+클라이언트 ──요청──▶ [ 라우터: 가입 처리 + 작업 등록 ] ──응답──▶ 클라이언트  (빠름)
+                                                          │
+                                                          ▼
+                              [ 백그라운드: 이메일 발송(2초) ]   ← 응답 후 실행
+```
+
+핵심은 **"응답이 클라이언트에게 모두 전송된 뒤, 등록된 작업이 실행된다"** 는 점이다. 등록(`add_task`)은 "예약" 일 뿐, 그 자리에서 바로 실행되는 게 아니다.
+
+> **그럼 작업이 실패하면 클라이언트가 알 수 있나?** 알 수 없다. 응답은 이미 나갔기 때문이다. 그래서 백그라운드 작업은 **"실패해도 클라이언트에게 알릴 필요가 없는 일"** 에만 써야 한다. 이 성질이 뒤에서 다룰 "예외 처리"·"한계" 의 출발점이다.
+
+---
+
+## 15.3 첫 번째 예제 — 응답을 먼저, 알림은 나중에
+
+가장 단순한 형태부터 만든다. 회원가입 응답을 즉시 돌려주고, "환영 알림" 을 백그라운드로 기록한다.
+
+이 챕터의 예제는 DB를 쓰지 않는다. 주제가 "백그라운드 작업이 응답 이후에 정말로 실행되는가" 이므로, 가장 단순한 형태인 **프로세스 메모리 안의 리스트**에 기록하고, 조회 엔드포인트로 확인한다. 실무라면 이 자리에 이메일 발송·DB 쓰기가 들어간다.
+
+먼저 작업 함수와 상태를 둘 모듈을 만든다.
+
+```python
+# app/state.py — 학습용 인메모리 상태
+notifications: list[str] = []
+
+
+def reset() -> None:
+    notifications.clear()
+```
+
+```python
+# app/tasks.py — 백그라운드에서 실행될 작업 함수
+from app import state
+
+
+def notify_welcome(username: str) -> None:
+    """가입 환영 알림을 "기록"한다(실무라면 이메일 발송)."""
+    state.notifications.append(f"환영합니다, {username}님!")
+```
+
+그리고 라우터.
+
+```python
+# app/main.py
+from fastapi import BackgroundTasks, FastAPI, status
+from pydantic import BaseModel, Field
+
+from app import state, tasks
+
+app = FastAPI()
+
+
+class SignupRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+
+
+@app.post("/signup", status_code=status.HTTP_201_CREATED)
+async def signup(payload: SignupRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(tasks.notify_welcome, payload.username)
+    return {"username": payload.username, "status": "registered"}
+
+
+@app.get("/notifications")
+async def list_notifications():
+    return {"notifications": list(state.notifications)}
+```
+
+여기서 일어나는 일을 한 줄씩 보자.
+
+1. **`background_tasks: BackgroundTasks`** — 라우터 함수의 인자로 이 타입을 적기만 하면, FastAPI가 `BackgroundTasks` 객체를 알아서 주입해 준다. (`Depends`도 필요 없다. 특별 취급되는 타입이다.)
+2. **`background_tasks.add_task(tasks.notify_welcome, payload.username)`** — "이 함수를, 이 인자로, 나중에 실행해 줘" 라는 예약이다. 이 줄에서 `notify_welcome`이 바로 실행되지는 **않는다**.
+3. **`return {...}`** — 이 응답이 먼저 클라이언트에게 전송된다.
+4. **그 뒤** FastAPI가 등록된 `notify_welcome("alice")`를 실행한다. 그래서 `state.notifications`에 메시지가 쌓인다.
+
+> **`add_task`의 인자 전달 방식** : `add_task(함수, 인자1, 인자2, 키워드=값)` 형태다. 함수를 먼저 적고, 그 뒤에 그 함수에 넘길 인자들을 이어 적는다. 함수를 `notify_welcome()` 처럼 **호출해서** 넘기는 게 아니라, `notify_welcome` 이라는 **함수 자체**를 넘긴다는 점을 주의하자. 호출해서 넘기면 그 자리에서 실행돼 버린다.
+
+---
+
+## 15.4 정말 "응답 후" 실행되는지 테스트로 확인
+
+말로만 "응답 후에 실행된다" 고 하면 와닿지 않는다. 테스트로 직접 확인하자. 이 챕터의 테스트 전략 자체가 학습 포인트다.
+
+```python
+# tests/conftest.py
+from collections.abc import AsyncGenerator
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app import state
+from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    """매 테스트 전에 인메모리 상태를 비운다(autouse 라 자동 적용)."""
+    state.reset()
+    yield
+    state.reset()
+
+
+@pytest_asyncio.fixture
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+```
+
+```python
+# tests/test_background_tasks.py
+async def test_가입_후_환영_알림이_백그라운드로_기록된다(client):
+    # 가입 요청. 응답을 받은 시점엔 백그라운드 작업이 이미 실행돼 있다.
+    res = await client.post("/signup", json={"username": "bob"})
+    assert res.status_code == 201
+
+    # 백그라운드 작업의 결과를 조회해서 확인.
+    res = await client.get("/notifications")
+    notifications = res.json()["notifications"]
+    assert len(notifications) == 1
+    assert "bob" in notifications[0]
+```
+
+### 15.4.1 테스트 타이밍의 핵심 — 왜 이게 통과하는가
+
+여기서 반드시 짚어야 할 미묘한 지점이 있다. 우리는 `POST /signup` 직후에 곧장 `GET /notifications`를 부르는데, **어떻게 그 사이에 백그라운드 작업이 이미 끝나 있을까?**
+
+답은 **httpx의 `ASGITransport`** 에 있다.
+
+> **`ASGITransport`란?** httpx가 요청을 진짜 네트워크가 아니라 ASGI 인터페이스로 앱에 직접 전달하는 방식이다(07·13장에서 통합 테스트에 썼다). 진짜 서버를 띄우지 않으므로 빠르고 격리된다.
+
+ASGI에서 한 요청의 수명은 "응답 본문 전송 → 백그라운드 작업 실행 → 요청 종료" 순서로 끝난다. 그리고 `ASGITransport`는 **이 수명이 모두 끝날 때까지 기다렸다가** `await client.post(...)`의 결과를 돌려준다. 그래서 `await client.post(...)`가 반환된 시점에는 백그라운드 작업까지 이미 완료돼 있다.
+
+정리하면:
+
+```
+await client.post("/signup", ...)
+   └─ 내부에서: 응답 생성 → 응답 전송 → 백그라운드 작업 실행 → 종료
+                                                      ▲
+                          여기까지 끝난 뒤에 await 가 반환된다
+```
+
+그래서 그 다음 줄에서 `GET /notifications`를 부르면 이미 기록이 쌓여 있는 것이다.
+
+> **실제 운영 서버(uvicorn + 진짜 네트워크)에서도 같나?** 동작의 의미("응답 후 실행")는 같지만, 타이밍은 다르다. 진짜 클라이언트는 응답 본문을 다 받으면 그 자리에서 `await`가 풀려 다음 줄로 갈 수 있고, 그 시점에 서버의 백그라운드 작업은 아직 진행 중일 수 있다. **테스트가 통과한다고 해서 "운영에서도 호출 직후 즉시 끝나 있다" 고 가정하면 안 된다.** 테스트가 깔끔하게 검증되는 건 어디까지나 `ASGITransport`의 in-process 특성 덕분이다.
+
+이 타이밍 차이는 헷갈리기 쉬우니 표로 정리한다.
+
+| | `ASGITransport`(테스트) | 진짜 uvicorn + 네트워크(운영) |
+|---|---|---|
+| `await client.post(...)` 반환 시점 | 백그라운드 작업까지 **완료됨** | 응답 수신만 완료, 백그라운드는 **진행 중일 수 있음** |
+| 검증 방법 | 호출 직후 상태 조회로 OK | 잠깐 대기·폴링하거나 결과 저장소를 확인 |
+
+---
+
+## 15.5 여러 작업을 등록하기
+
+`add_task`는 여러 번 부를 수 있다. 등록한 **순서대로** 실행된다.
+
+```python
+@app.post("/signup", status_code=status.HTTP_201_CREATED)
+async def signup(payload: SignupRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(tasks.notify_welcome, payload.username)
+    background_tasks.add_task(tasks.record_signup_audit, payload.username)
+    background_tasks.add_task(tasks.grant_starter_points, payload.username)
+    return {"username": payload.username, "status": "registered"}
+```
+
+이 라우터는 가입 응답을 즉시 돌려주고, 그 뒤에 세 작업을 차례로 실행한다.
+
+1. `notify_welcome` — 환영 알림 기록
+2. `record_signup_audit` — 감사 로그 한 줄
+3. `grant_starter_points` — 가입 보너스 포인트 지급
+
+> **순서가 보장되나?** 그렇다. `BackgroundTasks`는 등록된 작업을 등록 순서대로 **하나씩 순차** 실행한다. 동시에 병렬로 돌리지 않는다. 그래서 "A가 끝난 뒤 B" 같은 순서 의존이 있어도 안전하다. (반대로, 병렬 처리로 빨라지길 기대하면 안 된다.)
+
+테스트로 세 작업이 모두 수행됐는지 본다.
+
+```python
+async def test_여러_작업이_모두_실행된다(client):
+    await client.post("/signup", json={"username": "dave"})
+
+    notifications = (await client.get("/notifications")).json()["notifications"]
+    audit = (await client.get("/audit-log")).json()["entries"]
+
+    assert any("dave" in n for n in notifications)
+    assert any(e["username"] == "dave" for e in audit)
+    assert state.points["dave"] == 100   # 보너스 포인트도 지급됨
+```
+
+---
+
+## 15.6 동기 함수와 비동기 함수 — 둘 다 등록할 수 있다
+
+작업 함수는 `def`(동기)로 짜도 되고 `async def`(비동기)로 짜도 된다. `add_task`는 둘 다 받는다.
+
+```python
+# 동기 작업 함수
+def notify_welcome(username: str) -> None:
+    state.notifications.append(f"환영합니다, {username}님!")
+
+
+# 비동기 작업 함수
+async def record_signup_audit(username: str, *, source: str = "signup") -> None:
+    state.audit_log.append({"username": username, "source": source})
+```
+
+둘 다 똑같이 등록한다.
+
+```python
+background_tasks.add_task(notify_welcome, "alice")           # 동기
+background_tasks.add_task(record_signup_audit, "alice")      # 비동기
+```
+
+### 15.6.1 그럼 둘 중 무엇을 써야 하나
+
+기준은 **"그 작업 안에서 `await`가 필요한가"** 이다.
+
+- **`await`가 필요하면** (DB 세션 사용, httpx로 외부 API 호출 등) → `async def`로 짠다.
+- **`await`가 필요 없으면** (단순 계산, 파일 쓰기, 동기 라이브러리 호출) → `def`로 짜도 된다.
+
+> **동기 함수를 등록하면 이벤트 루프가 막히지 않나?** 안 막힌다. FastAPI(정확히는 Starlette)는 **동기 작업 함수를 스레드풀에서 실행**한다. 그래서 동기 함수 안에서 약간의 블로킹 작업(파일 쓰기 등)을 해도 메인 이벤트 루프를 멈추지 않는다. 반대로 `async def`로 짜 놓고 그 안에서 무거운 동기 CPU 작업을 `await` 없이 돌리면, 그게 오히려 이벤트 루프를 막을 수 있으니 주의하자.
+
+> **그럼 무거운 CPU 작업(이미지 변환 등)은?** 동기 함수로 짜서 스레드풀에 맡기면 이벤트 루프는 안 막힌다. 다만 스레드풀은 크기가 정해져 있어서, 무거운 작업이 많아지면 풀이 금방 가득 찬다. 이 지점이 바로 "외부 큐로 옮길 때" 의 신호다(15.9에서 다룬다).
+
+---
+
+## 15.7 의존성으로 BackgroundTasks 주입받기
+
+라우터가 여러 개로 늘어나면, **"이런 요청에는 항상 이 감사 로그를 남긴다"** 같은 공통 작업이 생긴다. 매 라우터에 똑같은 `add_task` 줄을 복사하는 대신, **의존성** 안에서 등록하면 한곳에 모을 수 있다.
+
+핵심은 **의존성 함수도 `BackgroundTasks`를 주입받을 수 있다**는 점이다. 그리고 한 요청 안에서는 **같은 `BackgroundTasks` 객체가 공유**된다.
+
+```python
+from fastapi import BackgroundTasks, Depends
+
+
+def audit_logger(background_tasks: BackgroundTasks) -> BackgroundTasks:
+    """의존성 안에서 공통 작업(감사 로그)을 미리 등록한다."""
+    background_tasks.add_task(
+        tasks.record_signup_audit, "(dependency)", source="dependency"
+    )
+    # 같은 객체를 돌려주면, 라우터가 이어서 다른 작업도 등록할 수 있다.
+    return background_tasks
+
+
+@app.post("/signup-via-dependency", status_code=status.HTTP_201_CREATED)
+async def signup_via_dependency(
+    payload: SignupRequest,
+    background_tasks: BackgroundTasks = Depends(audit_logger),
+):
+    # 의존성이 이미 감사 로그 작업을 등록했고,
+    # 여기서 같은 객체에 환영 알림 작업을 이어 등록한다.
+    background_tasks.add_task(tasks.notify_welcome, payload.username)
+    return {"username": payload.username, "status": "registered"}
+```
+
+이 라우터는 두 작업을 실행한다. **의존성이 등록한** 감사 로그와, **라우터가 등록한** 환영 알림이다. 둘 다 같은 `BackgroundTasks` 객체에 쌓였기 때문에 함께 실행된다.
+
+> **왜 이게 가능한가?** FastAPI의 의존성 주입은 "요청 단위" 로 동작한다. 한 요청을 처리하는 동안 `BackgroundTasks`는 하나만 만들어지고, 의존성 함수든 라우터 함수든 그 시그니처에 `BackgroundTasks`를 적으면 **모두 같은 인스턴스**를 받는다. 그래서 의존성에서 등록한 작업과 라우터에서 등록한 작업이 한 묶음으로 실행된다.
+
+테스트:
+
+```python
+async def test_의존성에서_등록한_작업과_라우터_작업이_함께_실행된다(client):
+    await client.post("/signup-via-dependency", json={"username": "grace"})
+
+    audit = (await client.get("/audit-log")).json()["entries"]
+    assert len(audit) == 1
+    assert audit[0]["source"] == "dependency"   # 의존성이 등록한 작업
+
+    notifications = (await client.get("/notifications")).json()["notifications"]
+    assert any("grace" in n for n in notifications)   # 라우터가 등록한 작업
+```
+
+---
+
+## 15.8 작업 함수를 안전하게 설계하기
+
+백그라운드 작업은 **응답이 이미 나간 뒤에 실행**된다. 이 성질 때문에 작업 함수는 일반 함수보다 더 조심해서 설계해야 한다. 두 가지 원칙이 핵심이다.
+
+### 15.8.1 예외 처리 — 실패해도 조용히
+
+응답이 이미 나갔으므로, 작업 함수가 예외를 던져도 **클라이언트는 그 사실을 알 수 없다**. 게다가 문제가 하나 더 있다.
+
+> **작업 하나가 예외를 던지면, 그 뒤에 등록된 다른 작업이 실행되지 않을 수 있다.** `BackgroundTasks`는 작업을 순차 실행하는데, 중간 작업이 예외로 멈추면 그 다음 작업까지 도달하지 못한다.
+
+그래서 **"실패해도 무방한 부수 작업"** 은 함수 안에서 예외를 직접 잡아 로그만 남기고 조용히 끝내는 게 안전하다.
+
+```python
+import logging
+
+logger = logging.getLogger("background-tasks")
+
+
+def risky_side_effect(username: str) -> None:
+    """실패할 수 있는 부수 작업(예: 외부 알림 서버 호출)."""
+    try:
+        # 실무라면 여기서 외부 호출이 일어나고, 실패할 수 있다.
+        raise RuntimeError("외부 알림 서버 응답 없음")
+    except Exception as exc:   # 부수 작업이라 광범위하게 잡아 삼킨다
+        state.failures.append(f"{username}: {exc}")
+        logger.warning("side effect failed for %s: %s", username, exc)
+```
+
+이렇게 해 두면, 이 작업을 다른 작업보다 **먼저** 등록해도 뒤 작업이 멈추지 않는다.
+
+```python
+@app.post("/signup-with-risky-task", status_code=status.HTTP_201_CREATED)
+async def signup_with_risky_task(payload, background_tasks):
+    background_tasks.add_task(tasks.risky_side_effect, payload.username)  # 먼저
+    background_tasks.add_task(tasks.notify_welcome, payload.username)     # 뒤
+    return {"username": payload.username, "status": "registered"}
+```
+
+테스트로 "앞 작업이 실패해도 뒤 작업은 실행된다" 를 확인한다.
+
+```python
+async def test_부수_작업이_실패해도_뒤_작업은_실행된다(client):
+    await client.post("/signup-with-risky-task", json={"username": "frank"})
+
+    # 실패는 함수 안에서 삼켜 기록되고,
+    assert len(state.failures) == 1
+    # 뒤에 등록한 환영 알림은 정상 실행된다.
+    notifications = (await client.get("/notifications")).json()["notifications"]
+    assert any("frank" in n for n in notifications)
+```
+
+> **모든 예외를 다 삼켜도 되나?** 아니다. "이 작업이 실패하면 데이터가 깨진다" 같은 **중요한 작업**이라면 예외를 삼키면 안 된다. 그런 작업은 애초에 백그라운드로 미루지 말고, 응답 전에 처리해 실패 시 4xx/5xx로 알리는 게 맞다. 예외를 삼켜도 되는 건 "실패해도 클라이언트와 무관한 부수 작업" 일 때뿐이다. **로그는 반드시 남기자.** 안 그러면 작업이 조용히 실패한 걸 아무도 모른다.
+
+### 15.8.2 멱등성 — 두 번 실행돼도 안전하게
+
+> **멱등성(idempotency)이란?** "같은 작업을 한 번 실행하든 여러 번 실행하든 결과가 같다" 는 성질이다. 예를 들어 "포인트를 100점으로 **설정**" 은 멱등이지만, "포인트를 100점 **추가**" 는 멱등이 아니다(두 번 하면 200점).
+
+백그라운드 작업은 재시도·중복 등록 등으로 **같은 입력에 두 번 실행될 수 있다**. 그래서 가능하면 멱등하게 설계해 둔다.
+
+```python
+def grant_starter_points(username: str, points: int = 100) -> None:
+    """가입 보너스 포인트를 1회만 지급한다(멱등)."""
+    if username in state.points:
+        logger.info("starter points already granted for %s — skip", username)
+        return   # 이미 지급했으면 건너뛴다
+    state.points[username] = points
+```
+
+"이미 처리했으면 건너뛴다" 는 조건 하나가 멱등성을 만든다. 같은 사용자로 두 번 가입 요청이 와도 포인트가 두 배가 되지 않는다.
+
+```python
+async def test_같은_사용자_보너스는_한_번만_지급된다(client):
+    await client.post("/signup", json={"username": "eve"})
+    await client.post("/signup", json={"username": "eve"})
+
+    assert state.points["eve"] == 100   # 두 배가 되지 않는다
+```
+
+> **실무에서는 어떻게 멱등성을 보장하나?** 흔한 방법은 (1) DB의 unique 제약으로 중복 INSERT를 막거나, (2) "처리 완료" 플래그를 두고 시작 전에 확인하거나, (3) 요청마다 고유한 **idempotency key**를 받아 이미 처리한 키면 건너뛰는 식이다. 외부 큐(Celery 등)를 쓸 때는 "작업이 최소 한 번 실행됨(at-least-once)" 을 보장하는 대신 중복 실행 가능성이 있어서, 멱등성이 더욱 중요해진다.
+
+---
+
+## 15.9 BackgroundTasks의 한계 — 언제 외부 큐로 넘겨야 하나
+
+여기가 이 챕터에서 **가장 중요한 절**이다. `BackgroundTasks`는 강력하지만, 분명한 한계가 있다. 이 한계를 모르고 무거운 일을 맡기면 운영에서 사고가 난다.
+
+### 15.9.1 같은 프로세스·같은 요청 수명에 묶인다
+
+`BackgroundTasks`로 등록한 작업은 **그 요청을 처리한 바로 그 워커 프로세스 안에서, 응답 직후에** 실행된다. 여기서 세 가지 한계가 따라 나온다.
+
+1. **서버가 죽으면 작업도 사라진다.** 작업이 메모리에만 있으므로, 응답을 보낸 직후 작업 실행 전(또는 도중)에 프로세스가 재시작·크래시되면 그 작업은 **그냥 유실**된다. 어디에도 기록이 남지 않는다.
+2. **재시도가 없다.** 작업이 실패해도 자동으로 다시 시도하지 않는다. 직접 try/except로 처리하는 게 전부다.
+3. **워커 자원을 같이 쓴다.** 백그라운드 작업은 그 요청을 처리한 워커의 자원(이벤트 루프·스레드풀)을 함께 쓴다. 무거운 작업이 쌓이면 **그 워커가 새 요청을 받는 능력**까지 갉아먹는다.
+
+> **"요청 수명에 묶인다" 를 다시 정리하면** : 작업은 응답 전송이 끝난 직후, 같은 프로세스에서 실행된다. 별도의 영속 큐나 별도 워커가 없다. 그래서 "확실히 실행돼야 하는 일", "오래 걸리는 일", "여러 서버에 분산해야 하는 일" 에는 맞지 않는다.
+
+### 15.9.2 BackgroundTasks가 적합한 경우 / 부적합한 경우
+
+판단 기준을 표로 정리한다.
+
+| 상황 | `BackgroundTasks` | 외부 큐(Celery·RQ·arq) |
+|------|:---:|:---:|
+| 가볍고 빠른 부수 작업(로그, 짧은 알림) | ✅ 적합 | 과함 |
+| 실패해도 무방한 작업 | ✅ 적합 | 가능 |
+| 무거운/오래 걸리는 작업(영상 변환, 대량 처리) | ❌ 부적합 | ✅ 적합 |
+| 반드시 실행 보장(유실되면 안 됨) | ❌ 부적합 | ✅ 적합 |
+| 자동 재시도가 필요 | ❌ 부적합 | ✅ 적합 |
+| 정해진 시간에 실행(스케줄링) | ❌ 부적합 | ✅ 적합 |
+| 여러 서버/워커로 분산 | ❌ 부적합 | ✅ 적합 |
+| 작업 진행 상황·결과 추적 | ❌ 부적합 | ✅ 적합 |
+
+한 줄 기준:
+
+> **"가볍고, 실패해도 괜찮고, 지금 이 프로세스에서 끝내도 되는 일" 이면 `BackgroundTasks`. 그 밖이면 외부 큐.**
+
+### 15.9.3 외부 큐는 어디서 배우나
+
+무거운 작업을 본격적으로 다뤄야 한다면 **외부 작업 큐**로 넘어간다. 큐는 작업을 별도 저장소(보통 Redis)에 영속적으로 쌓아 두고, **별도의 워커 프로세스**가 그걸 꺼내 실행한다. 그래서 서버가 죽어도 작업이 안 사라지고, 재시도·스케줄링·분산이 가능해진다.
+
+대표 도구:
+
+- **arq** — asyncio 친화적이고 가볍다. 새 프로젝트에 권장.
+- **Celery** — 가장 큰 생태계. 복잡한 워크플로·스케줄링이 필요할 때.
+- **RQ** — Redis 기반의 단순한 큐.
+
+이 도구들의 최신 버전과 사용 예제는 **[12장 유틸리티 및 라이브러리](12-utilities.md)** 에 정리돼 있다(특히 arq·Celery 절). 흐름의 모양만 미리 한 줄로 비유하면:
+
+```
+[ FastAPI 라우터 ] ──작업 등록──▶ [ Redis 큐 ] ◀──작업 꺼냄── [ 별도 워커 프로세스 ]
+   (응답은 즉시 반환)              (영속 저장)              (서버가 죽어도 살아남음)
+```
+
+`BackgroundTasks`의 화살표가 "같은 프로세스 안" 으로 돌아왔던 것과 달리, 외부 큐는 **작업이 프로세스 밖의 저장소로 나간다**. 이 한 가지 차이가 위 표의 모든 차이를 만든다.
+
+---
+
+## 15.10 흔한 실수 / 트러블슈팅
+
+### 15.10.1 `add_task`에 함수를 호출해서 넘김
+
+```python
+# ✗ 잘못 — 그 자리에서 실행돼 버린다(반환값을 등록하려는 꼴)
+background_tasks.add_task(notify_welcome(username))
+
+# ✓ 올바름 — 함수와 인자를 따로 넘긴다
+background_tasks.add_task(notify_welcome, username)
+```
+
+`add_task`는 "함수 자체 + 인자들" 을 받는다. 함수를 호출(`()`)해서 넘기면 그 자리에서 실행되고, 그 **반환값**(보통 `None`)이 작업으로 등록되는 이상한 상황이 된다.
+
+### 15.10.2 응답에 작업 결과를 담으려 함
+
+```python
+# ✗ 백그라운드 작업의 결과는 응답에 담을 수 없다
+result = background_tasks.add_task(...)   # add_task 는 결과를 돌려주지 않는다
+```
+
+백그라운드 작업은 **응답 후** 실행되므로, 그 결과를 같은 응답에 담는 것은 원리적으로 불가능하다. 결과가 필요하면 (1) 응답 전에 동기로 처리하거나, (2) 외부 큐 + 결과 저장소를 쓰고 클라이언트가 나중에 폴링하게 한다.
+
+### 15.10.3 테스트에서 "작업이 아직 안 끝났다" 며 실패
+
+`ASGITransport`를 쓰면 `await client.post(...)`가 반환될 때 백그라운드 작업까지 끝나 있다(15.4.1). 그런데도 실패한다면 의심할 곳:
+
+- 작업 함수가 **조용히 예외를 던지고 있다** → 등록한 작업 안에서 예외가 나면 그 작업의 효과가 안 보인다. 함수에 try/except와 로그를 넣어 확인.
+- **상태 초기화가 안 됐다** → 인메모리 상태가 이전 테스트에서 누적됐을 수 있다. `reset()`을 autouse fixture로 매 테스트 전에 부르는지 확인(15.4의 conftest).
+
+### 15.10.4 진짜 서버에서 "호출 직후 결과가 없다"
+
+운영(uvicorn + 네트워크)에서는 응답을 받은 직후에 백그라운드 작업이 아직 진행 중일 수 있다(15.4.1 표). 이건 버그가 아니라 정상이다. 결과를 확인해야 하면 잠깐 대기·폴링하거나, 애초에 결과 추적이 필요한 작업이라면 외부 큐로 옮기는 신호로 받아들이자.
+
+### 15.10.5 무거운 작업을 BackgroundTasks에 맡겨 응답이 느려짐(처럼 보임)
+
+`BackgroundTasks` 자체는 응답을 막지 않는다. 다만 무거운 작업이 그 워커의 스레드풀·이벤트 루프를 점유하면, **그 워커가 받는 다음 요청들**이 느려질 수 있다. "응답은 빠른데 서버 전체가 점점 느려진다" 면 작업이 너무 무거운 것이다 → 외부 큐로(15.9).
+
+---
+
+## 15.11 이 챕터 요약
+
+- `BackgroundTasks`는 **응답을 먼저 보내고, 부수 작업을 그 뒤에서** 실행하는 FastAPI 기본 도구다. 별도 라이브러리·서버가 필요 없다.
+- 라우터 인자에 `background_tasks: BackgroundTasks`를 적으면 자동 주입된다. `add_task(함수, 인자...)`로 등록하고, 등록은 "예약" 일 뿐 그 자리에서 실행되지 않는다.
+- 작업은 **응답 전송이 끝난 뒤** 등록 순서대로 **순차** 실행된다. 테스트에서는 `ASGITransport` 덕분에 `await client.post(...)` 반환 시점에 작업까지 끝나 있어, 호출 직후 상태를 조회해 검증한다(운영의 타이밍과는 다름에 유의).
+- 작업 함수는 **동기(`def`)·비동기(`async def`)** 둘 다 등록 가능하다. `await`가 필요하면 `async def`, 아니면 `def`(스레드풀에서 실행되어 이벤트 루프를 막지 않음).
+- `BackgroundTasks`는 **의존성으로 주입**받을 수 있고, 한 요청 안에서 같은 객체가 공유되므로 공통 작업을 의존성에 모을 수 있다.
+- 작업 함수는 **예외 처리**(부수 작업은 삼키고 로그, 중요 작업은 애초에 백그라운드로 미루지 않기)와 **멱등성**(두 번 실행돼도 안전)을 갖추도록 설계한다.
+- **한계가 핵심이다.** `BackgroundTasks`는 같은 프로세스·요청 수명에 묶여서, 서버가 죽으면 유실되고, 재시도·스케줄링·분산이 없다. **무겁거나 반드시 실행돼야 하거나 재시도가 필요한 일은 arq·Celery·RQ 같은 외부 큐로** 넘긴다(→ [12장](12-utilities.md)).
+
+다음 챕터에서는 에러를 일관되게 다루고, 무슨 일이 일어났는지 **로그로 남기는** 방법을 배운다. 백그라운드 작업이 조용히 실패했을 때 그걸 알아채는 것도 결국 로깅의 몫이다.
+
+---
+
+← [14. 파일 업로드](14-file-upload.md) | [README로 돌아가기](../README.md) | 다음 문서로 이동: **[16. 에러 핸들링·로깅 →](16-error-logging.md)**
+
+<a id="ch16"></a>
+
+# 16. 에러 핸들링·로깅 심화
+
+> **이 챕터의 목표**
+> - 05장에서 한 줄로 만났던 `HTTPException` 과 `@app.exception_handler` 를 한 단계 끌어올려, **커스텀 예외 클래스**와 **전역 예외 핸들러**로 에러 처리를 한 곳에 모은다.
+> - 모든 에러가 같은 모양으로 나가도록 **일관된 에러 응답 스키마**(`code` / `message` / `detail`) 를 설계한다.
+> - `RequestValidationError`(422) 핸들러를 커스터마이징해 검증 실패도 같은 스키마로 통일한다.
+> - **요청 ID 미들웨어**(`X-Request-ID`) 로 요청 하나하나에 고유 ID 를 붙이고, 그 ID 를 응답 헤더와 로그에 함께 실어 **로그 상관관계(log correlation)** 를 만든다.
+> - 표준 라이브러리 `logging` 을 포매터·레벨·핸들러·필터로 제대로 설정하고, 예외를 트레이스백과 함께 로그에 남긴다.
+
+> **소요 시간**: 2~4시간
+
+> **전제**: 05·08장(HTTPException, 의존성, 미들웨어)
+
+> **모르는 단어가 나오면** 먼저 [용어 사전(glossary.md)](glossary.md) 을 펼쳐 한두 줄만 읽고 돌아오면 된다.
+
+---
+
+## 16.1 왜 에러 처리와 로깅을 따로 한 장으로 다루나
+
+지금까지 우리는 에러가 나면 그때그때 `HTTPException` 을 던졌다(05·07·08장). 작은 앱에서는 그걸로 충분하다. 그런데 코드가 자라면 같은 질문이 반복된다.
+
+- 404 를 던지는 코드가 라우터마다 흩어져 있다. **에러 메시지 형식이 제각각**이다.
+- 어떤 라우트는 `{"detail": "..."}`, 어떤 라우트는 `{"message": "..."}` 를 돌려준다. **클라이언트가 에러를 일관되게 처리할 수 없다**.
+- 검증 실패(422)는 또 다른 모양(`{"detail": [...]}`) 이라 형식이 셋으로 갈린다.
+- 운영에서 "그 사용자의 그 요청이 왜 실패했는지" 를 로그에서 **찾을 수가 없다**. 어떤 로그가 어떤 요청에 속하는지 표시가 없기 때문이다.
+- 예상 못 한 예외가 나면 **트레이스백이 클라이언트에게 그대로 노출**되거나(보안 문제), 반대로 아무 데도 안 남아 디버깅이 불가능하다.
+
+이 장은 이 다섯 가지를 한 번에 정리한다. 핵심 도구는 네 가지다.
+
+1. **커스텀 예외 클래스** — 도메인 상황(자원 없음, 규칙 위반)을 예외 타입으로 표현한다.
+2. **전역 예외 핸들러** — 그 예외들을 한 곳에서 일관된 JSON 으로 변환한다.
+3. **요청 ID 미들웨어** — 요청마다 ID 를 붙여 로그와 응답을 잇는다.
+4. **표준 logging 설정** — 포매터·레벨·핸들러·필터를 제대로 구성한다.
+
+> **이 장은 DB 가 없다.** 주제(에러·로깅)에 집중하기 위해 데이터는 인메모리 `dict` 로 둔다. 실제 앱이라면 06~07장처럼 SQLAlchemy 가 들어오지만, 에러·로깅 패턴은 DB 유무와 무관하게 똑같이 적용된다.
+
+---
+
+## 16.2 큰 그림 — 무엇을 만들 것인가
+
+만들 것은 작은 시연용 API 다. **기능보다 "에러가 났을 때 무슨 일이 일어나는가"** 를 보여주는 데 집중한다.
+
+| 메서드 | 경로 | 설명 | 결과 |
+|--------|------|------|------|
+| `GET` | `/health` | 헬스 체크 | 200 |
+| `GET` | `/items/{item_id}` | 단건 조회 | 200 / 404(커스텀 예외) |
+| `POST` | `/orders` | 주문 | 200 / 404 / 409 / 422 |
+| `GET` | `/boom` | 예상 못 한 예외 시연 | 500 |
+
+이 네 엔드포인트로 다음 다섯 가지 에러 경로를 전부 시연한다.
+
+1. **정상 응답**(200) — 핸들러가 정상 흐름을 망가뜨리지 않는다.
+2. **커스텀 예외 → 404** — `ResourceNotFound("item", 9999)`.
+3. **비즈니스 규칙 위반 → 409** — `BusinessRuleError("재고가 부족합니다")`.
+4. **검증 실패 → 422** — Pydantic 검증을 커스텀 핸들러로 다듬는다.
+5. **예상 못 한 예외 → 500** — 트레이스백은 로그에만, 클라이언트에는 일반 메시지만.
+
+그리고 이 모든 응답에 **`X-Request-ID` 헤더**가 붙고, 서버 로그의 모든 줄에 같은 ID 가 찍힌다.
+
+### 16.2.1 패키지 구조 한 그림
+
+```
+16-ErrorLogging/
+├── pyproject.toml
+├── .python-version
+├── .gitignore
+├── README.md
+└── app/
+    ├── __init__.py
+    ├── main.py                ← 앱 조립 + 시연 엔드포인트
+    ├── errors.py              ← 커스텀 예외 + 에러 스키마 + 전역 핸들러
+    ├── middleware.py          ← 요청 ID(X-Request-ID) 미들웨어
+    ├── request_context.py     ← 요청 ID 를 담는 ContextVar
+    └── logging_config.py      ← 표준 logging 설정(포매터·핸들러·필터)
+```
+
+각 파일의 한 줄 정의:
+
+| 파일 | 책임 한 줄 |
+|------|------------|
+| `app/main.py` | 로깅·미들웨어·핸들러를 조립하고, 시연 엔드포인트를 둔다 |
+| `app/errors.py` | 커스텀 예외, 에러 응답 스키마, 전역 예외 핸들러를 모두 모은다 |
+| `app/middleware.py` | 요청마다 `X-Request-ID` 를 부여·전파하는 미들웨어 |
+| `app/request_context.py` | 요청 ID 를 어디서나 읽을 수 있게 `ContextVar` 로 보관한다 |
+| `app/logging_config.py` | 표준 `logging` 의 포매터·핸들러·필터를 한 함수로 설정한다 |
+
+이 표가 곧 우리의 작업 순서다. 다만 "왜" 부터 차근히 보기 위해 `HTTPException` 복습부터 시작한다.
+
+---
+
+## 16.3 출발점 — `HTTPException` 복습
+
+05장에서 배운 표준은 이랬다. 에러가 필요하면 `HTTPException` 을 `raise` 한다.
+
+```python
+from fastapi import APIRouter, HTTPException, status
+
+router = APIRouter()
+
+
+@router.get("/items/{item_id}")
+async def get_item(item_id: int):
+    item = ITEMS.get(item_id)
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item {item_id} 를 찾을 수 없습니다",
+        )
+    return item
+```
+
+`HTTPException(status_code=404, detail="...")` 는 자동으로 다음 JSON 으로 직렬화된다.
+
+```json
+{ "detail": "Item 9999 를 찾을 수 없습니다" }
+```
+
+이 방식의 장점은 분명하다. 짧고, `/docs` 에도 잘 표시된다. **작은 앱에서는 이게 정답이다.** 그런데 두 가지 한계가 있다.
+
+1. **응답 모양이 `{"detail": ...}` 로 고정**이라, 기계가 분기할 에러 코드(`resource_not_found` 같은)를 같이 싣기 어렵다. `detail` 에 dict 를 넣을 수는 있지만, 그러면 라우트마다 모양이 또 제각각이 된다.
+2. **같은 404 를 던지는 코드가 여기저기 흩어진다.** "Todo 404", "User 404", "Item 404" 가 각자 다른 메시지 형식으로 자란다.
+
+해법은 05장 5.8.4 에서 살짝 맛본 **커스텀 예외 + 핸들러** 다. 거기서는 "코드가 커졌을 때 진가를 발휘한다" 고만 했는데, 이 장이 바로 그 "커졌을 때" 다.
+
+> **`HTTPException` 을 버리는 게 아니다.** 뒤에서 보겠지만, `HTTPException` 도 우리의 일관된 에러 스키마로 흡수한다. 직접 `raise HTTPException(...)` 한 곳, 그리고 프레임워크가 자동으로 내는 404·405 까지 전부 같은 모양으로 통일하는 게 목표다.
+
+---
+
+## 16.4 일관된 에러 응답 스키마 설계
+
+코드를 짜기 전에 **"에러는 어떤 모양으로 나갈 것인가"** 를 먼저 정한다. 이게 이 장의 뼈대다.
+
+우리가 쓸 모양은 다음과 같다.
+
+```json
+{
+  "error": {
+    "code": "resource_not_found",
+    "message": "item 9999 를 찾을 수 없습니다",
+    "detail": { "resource": "item", "id": 9999 },
+    "request_id": "ae510f2727354c37a1bdecbca61e2033"
+  }
+}
+```
+
+네 필드의 역할:
+
+| 필드 | 타입 | 역할 |
+|------|------|------|
+| `code` | `str` | **기계**가 분기할 짧은 식별자. 프런트엔드가 `if code == "resource_not_found"` 처럼 쓴다. |
+| `message` | `str` | **사람**이 읽는 한 줄 설명. 화면에 그대로 띄울 수 있다. |
+| `detail` | `any \| null` | 부가 정보. 검증 에러 목록, 어떤 자원이 없었는지 등. 없으면 `null`. |
+| `request_id` | `str` | 이 에러가 난 요청의 ID. 사용자가 이 값을 알려주면 운영자가 로그에서 정확히 찾는다. |
+
+> **왜 `code` 와 `message` 를 나누나?** `message` 는 사람이 읽으라고 있는 거라 언제든 바뀔 수 있다("Item 없음" → "상품을 찾을 수 없습니다"). 그런데 프런트엔드 코드가 메시지 **문자열**로 분기하면, 메시지를 다듬는 순간 클라이언트가 깨진다. 그래서 **변하지 않는 기계용 식별자(`code`)** 와 **언제든 바뀌어도 되는 사람용 문장(`message`)** 을 분리한다. 이건 거의 모든 잘 설계된 API(Stripe, GitHub 등)가 쓰는 패턴이다.
+
+이 모양을 Pydantic 스키마로 못 박는다. `app/errors.py` 의 맨 위에 둔다.
+
+```python
+# app/errors.py (윗부분)
+from pydantic import BaseModel
+
+
+class ErrorBody(BaseModel):
+    """에러 응답의 `error` 안쪽 본문."""
+
+    code: str  # 기계가 분기할 수 있는 짧은 식별자 (예: "resource_not_found")
+    message: str  # 사람이 읽는 한 줄 설명
+    detail: object | None = None  # 부가 정보(검증 에러 목록 등). 없으면 null.
+    request_id: str  # 이 에러가 발생한 요청의 ID. 로그와 대조할 수 있다.
+
+
+class ErrorResponse(BaseModel):
+    """최상위 에러 응답. 모든 에러가 이 모양으로 나간다."""
+
+    error: ErrorBody
+```
+
+> **왜 `error` 로 한 겹 감싸나?** 최상위에 `error` 키를 두면, 정상 응답과 에러 응답을 클라이언트가 한눈에 구분할 수 있다. `"error" in body` 한 줄이면 끝이다. (취향에 따라 감싸지 않기도 한다. 중요한 건 "**프로젝트 안에서 하나로 통일**" 이다.)
+
+---
+
+## 16.5 요청 ID 를 어디서나 읽기 — `ContextVar`
+
+에러 응답에 `request_id` 를 넣으려면, 핸들러가 "지금 처리 중인 요청의 ID" 를 알아야 한다. 그런데 예외 핸들러 함수는 `request_id` 를 인자로 받지 않는다. 또 로그를 찍는 `crud` 함수도, 서비스 함수도 ID 를 알아야 하는데 매번 인자로 넘기는 건 번거롭다.
+
+해법은 표준 라이브러리 `contextvars.ContextVar` 다.
+
+```python
+# app/request_context.py
+from contextvars import ContextVar
+
+# 기본값 "-" : 아직 미들웨어를 거치지 않은(요청 밖) 로그에도 안전하게 찍힌다.
+_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+def set_request_id(request_id: str) -> None:
+    """현재 요청의 ID 를 컨텍스트에 저장한다(미들웨어가 호출)."""
+    _request_id_ctx.set(request_id)
+
+
+def get_request_id() -> str:
+    """현재 요청의 ID 를 읽는다. 요청 밖이면 '-' 를 돌려준다."""
+    return _request_id_ctx.get()
+```
+
+미들웨어가 요청 시작 시점에 `set_request_id(...)` 로 ID 를 심으면, 같은 요청을 처리하는 **모든 코드**가 `get_request_id()` 한 줄로 같은 값을 읽는다. 인자로 들고 다닐 필요가 없다.
+
+> **그냥 전역 변수(`REQUEST_ID = "..."`) 면 안 되나?** 안 된다. 비동기 서버는 여러 요청을 **동시에(번갈아)** 처리한다. 평범한 전역 변수는 요청 A 가 심은 값을 요청 B 가 덮어써서, 로그가 뒤섞인다. `ContextVar` 는 각 실행 흐름(async task)마다 **독립된 값**을 보관하므로 안전하다. 이게 `ContextVar` 가 존재하는 이유다.
+
+> **`default="-"` 의 의미** : 미들웨어를 아직 안 거친 상황(앱 시작 로그, 백그라운드 작업 등)에서 `get_request_id()` 를 불러도 에러 없이 `"-"` 가 나온다. 로그 포맷이 깨지지 않는다.
+
+---
+
+## 16.6 표준 `logging` 설정 — 포매터·핸들러·필터
+
+`print` 는 운영에 부적합하다(12장 12.35 절). 레벨·형식·출력 대상을 분리해 관리하려면 `logging` 을 제대로 설정해야 한다. 우리가 쓸 최소 구성을 한 함수에 모은다.
+
+```python
+# app/logging_config.py
+import logging
+import sys
+
+from app.request_context import get_request_id
+
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s [req=%(request_id)s] %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+class RequestIdFilter(logging.Filter):
+    """모든 로그 레코드에 현재 요청 ID 를 붙여주는 필터.
+
+    포매터가 `%(request_id)s` 를 쓰려면 모든 레코드에 `request_id` 속성이 있어야 한다.
+    이 필터가 레코드마다 그 속성을 채워 넣는다. (요청 밖에서 찍힌 로그는 '-' 가 된다.)
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = get_request_id()
+        return True  # True 를 돌려줘야 레코드가 통과한다(필터링 탈락이 아님).
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """애플리케이션 로깅을 한 번 설정한다.
+
+    앱이 뜰 때 한 번만 부르면 된다. 여러 번 불려도 기존 핸들러를 정리하고
+    다시 붙이므로 핸들러가 중복되지 않는다(중복되면 로그가 두 번씩 찍힌다).
+    """
+    formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=DATE_FORMAT)
+
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.setFormatter(formatter)
+    handler.addFilter(RequestIdFilter())
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # 핸들러 중복 방지: 이미 붙어 있던 것을 떼고 우리 핸들러 하나만 둔다.
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+```
+
+`logging` 의 네 부품을 정확히 짚자.
+
+### 16.6.1 로거 / 핸들러 / 포매터 / 필터
+
+`logging` 은 네 종류의 부품으로 이루어진다. 처음엔 헷갈리지만 역할이 또렷하다.
+
+| 부품 | 한 줄 역할 | 우리 코드에서 |
+|------|-----------|---------------|
+| **Logger** | 로그를 "발생" 시키는 입구. `logging.getLogger("app.errors")` | 각 모듈이 자기 이름의 로거를 쓴다 |
+| **Handler** | 로그를 **어디로** 보낼지. 파일·표준출력·외부 시스템 | `StreamHandler(sys.stdout)` 하나 |
+| **Formatter** | 로그 한 줄의 **모양**(시각·레벨·메시지) | `LOG_FORMAT` 문자열 |
+| **Filter** | 레코드를 거르거나 **속성을 추가** | `RequestIdFilter` 가 `request_id` 주입 |
+
+> **로거는 이름으로 계층을 이룬다.** `logging.getLogger("app.errors")` 와 `logging.getLogger("app.request")` 는 모두 루트 로거(`logging.getLogger()`)의 자식이다. 루트에 핸들러 하나만 붙이면, 자식 로거들이 발생시킨 로그가 자동으로 그 핸들러로 흘러 올라간다(propagation). 그래서 우리는 **루트에 핸들러 하나, 포매터 하나, 필터 하나** 만 둔다.
+
+### 16.6.2 포매터 문자열 뜯어보기
+
+```
+%(asctime)s [%(levelname)s] %(name)s [req=%(request_id)s] %(message)s
+```
+
+| 토큰 | 뜻 | 예시 |
+|------|-----|------|
+| `%(asctime)s` | 시각 | `2026-06-24 11:55:57` |
+| `%(levelname)s` | 레벨 | `INFO`, `WARNING`, `ERROR` |
+| `%(name)s` | 로거 이름 | `app.errors` |
+| `%(request_id)s` | **우리가 추가한** 요청 ID | `ae510f...` |
+| `%(message)s` | 실제 메시지 | `요청 시작 GET /items/1` |
+
+실제 출력은 이렇게 나온다.
+
+```
+2026-06-24 11:55:57 [WARNING] app.errors [req=ae510f27...] 도메인 예외: item 9999 를 찾을 수 없습니다 (code=resource_not_found)
+```
+
+`[req=...]` 한 토막이 이 장의 핵심이다. **로그 한 줄만 봐도 어느 요청에서 났는지** 알 수 있다.
+
+### 16.6.3 `Filter` 로 모든 레코드에 요청 ID 주입
+
+포매터에 `%(request_id)s` 를 쓰면, `logging` 은 모든 로그 레코드에 `request_id` 라는 속성이 있다고 가정한다. 그런데 기본 레코드에는 그런 속성이 없다 → `KeyError` 로 로그가 깨진다.
+
+`RequestIdFilter` 가 이 구멍을 메운다. 필터의 `filter()` 메서드는 레코드가 통과할 때마다 불리는데, 우리는 거기서 거르는 대신 **속성을 추가**한다.
+
+```python
+def filter(self, record: logging.LogRecord) -> bool:
+    record.request_id = get_request_id()
+    return True
+```
+
+- `record.request_id = get_request_id()` — 현재 요청 ID(없으면 `"-"`)를 레코드에 단다.
+- `return True` — "이 레코드를 버리지 말고 통과시켜라". 필터는 원래 "거르는" 용도지만, 이렇게 **속성 주입 훅**으로도 쓰는 게 표준 관용구다.
+
+> **왜 `LoggerAdapter` 나 `extra=` 가 아니라 필터인가?** `logger.info("...", extra={"request_id": ...})` 처럼 매번 `extra` 를 넘기는 방법도 있다. 하지만 그러면 **모든 로그 호출**에 `extra` 를 붙여야 하고, 한 군데라도 빠뜨리면 `KeyError` 다. 게다가 우리가 직접 부르지 않는 라이브러리(`uvicorn`, `httpx`)의 로그에는 `extra` 를 넣을 수조차 없다. 필터를 핸들러에 붙이면 **그 핸들러를 거치는 모든 로그**(우리 것 + 라이브러리 것)에 자동으로 ID 가 붙는다. 훨씬 견고하다.
+
+### 16.6.4 핸들러 중복 방지
+
+`setup_logging` 끝부분을 보자.
+
+```python
+for existing in list(root.handlers):
+    root.removeHandler(existing)
+root.addHandler(handler)
+```
+
+`--reload` 로 개발하거나 테스트에서 앱을 여러 번 import 하면 `setup_logging` 이 두 번 불릴 수 있다. 그때마다 핸들러를 그냥 `addHandler` 하면 핸들러가 쌓여서 **같은 로그가 2번, 3번씩 찍힌다.** 기존 핸들러를 먼저 떼고 하나만 붙이면 이 함정을 피한다.
+
+> **`logging.basicConfig()` 면 충분하지 않나?** `basicConfig` 는 "이미 핸들러가 있으면 아무 것도 안 함" 이라 두 번째 호출이 무시된다. 편하지만 **필터를 핸들러에 붙이기**가 번거롭고, 재설정도 까다롭다. 명시적으로 핸들러를 만들어 두면 필터 부착·중복 제거를 우리가 통제할 수 있다.
+
+---
+
+## 16.7 커스텀 예외 클래스
+
+이제 도메인 상황을 **예외 타입**으로 표현한다. `app/errors.py` 에 이어서 적는다.
+
+```python
+# app/errors.py (이어서)
+from fastapi import status
+
+
+class AppError(Exception):
+    """이 앱의 모든 도메인 예외의 부모.
+
+    공통 속성을 정의해 두면, 핸들러 하나로 자식 예외 전부를 처리할 수 있다.
+    """
+
+    status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR
+    code: str = "internal_error"
+
+    def __init__(self, message: str, *, detail: object | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+
+class ResourceNotFound(AppError):
+    """요청한 자원이 없을 때. 404 로 매핑된다."""
+
+    status_code = status.HTTP_404_NOT_FOUND
+    code = "resource_not_found"
+
+    def __init__(self, resource: str, resource_id: object) -> None:
+        super().__init__(
+            message=f"{resource} {resource_id!r} 를 찾을 수 없습니다",
+            detail={"resource": resource, "id": resource_id},
+        )
+
+
+class BusinessRuleError(AppError):
+    """비즈니스 규칙 위반(예: 잔액 부족, 중복 신청). 409 로 매핑된다."""
+
+    status_code = status.HTTP_409_CONFLICT
+    code = "business_rule_violation"
+```
+
+설계의 핵심은 **부모 클래스 `AppError`** 다.
+
+- `status_code` 와 `code` 를 **클래스 속성**으로 둔다. 자식이 이 둘만 바꾸면 새 예외 타입이 완성된다.
+- `ResourceNotFound` 는 `status_code = 404`, `code = "resource_not_found"`.
+- `BusinessRuleError` 는 `status_code = 409`, `code = "business_rule_violation"`.
+
+이렇게 부모를 두면, 핸들러를 **`AppError` 하나에만** 등록해도 모든 자식 예외가 잡힌다(파이썬의 `except AppError` 가 자식까지 잡는 것과 같은 원리). 새 예외 타입을 추가해도 핸들러는 그대로다.
+
+> **`raise HTTPException(404, ...)` 와 뭐가 다른가?** 두 가지가 다르다. ① **의미가 코드에 드러난다.** `raise ResourceNotFound("item", id)` 는 "자원이 없다" 는 도메인 사실을 말한다. HTTP 상태 코드(404)는 그 사실의 _번역_ 일 뿐이고, 번역은 핸들러가 한 곳에서 맡는다. ② **재사용·일관성.** "item 없음" 메시지 형식이 `ResourceNotFound` 안에 한 번만 정의된다. 모든 라우터가 같은 형식을 공유한다.
+
+> **`resource_id!r` 의 `!r`** 은 f-string 에서 `repr()` 을 쓰라는 표시다. 문자열이면 따옴표가 붙어(`'abc'`) 숫자(`9999`)와 구분이 또렷해진다. 디버깅 메시지에서 유용하다.
+
+---
+
+## 16.8 전역 예외 핸들러
+
+예외를 정의했으니, 이제 그것을 **일관된 JSON 으로 변환**하는 핸들러를 만든다. `app/errors.py` 에 이어서 적는다. 먼저 모든 핸들러가 공유할 **렌더 함수** 부터.
+
+```python
+# app/errors.py (이어서)
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.request_context import get_request_id
+
+logger = logging.getLogger("app.errors")
+
+
+def _render(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    detail: object | None = None,
+) -> JSONResponse:
+    """일관된 에러 JSON 응답을 만든다. 모든 핸들러가 이 함수를 거친다."""
+    body = ErrorResponse(
+        error=ErrorBody(
+            code=code,
+            message=message,
+            detail=detail,
+            request_id=get_request_id(),
+        )
+    )
+    return JSONResponse(
+        status_code=status_code,
+        # model_dump() 만으로는 datetime 등 일부 타입이 JSON 으로 안 바뀔 수 있어
+        # jsonable_encoder 로 한 번 더 감싸 안전하게 직렬화한다.
+        content=jsonable_encoder(body.model_dump()),
+    )
+```
+
+`_render` 한 함수가 **모든 에러의 단일 출구**다. `request_id` 를 여기서 한 번만 채우므로, 각 핸들러는 `code`/`message`/`detail` 만 신경 쓰면 된다.
+
+> **`jsonable_encoder` 는 왜 쓰나?** `JSONResponse` 에 dict 를 넘기면 표준 `json` 모듈로 직렬화하는데, `datetime`·`UUID`·`Decimal` 같은 타입은 그대로는 직렬화가 안 돼 에러가 난다. `jsonable_encoder` 는 FastAPI 가 평소 응답에 쓰는 변환기로, 이런 타입들을 JSON 이 이해하는 형태(문자열 등)로 미리 바꿔준다. 에러 응답에도 같은 변환기를 쓰면 안전하다.
+
+### 16.8.1 커스텀 예외 핸들러
+
+```python
+# app/errors.py (이어서)
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    """우리가 정의한 도메인 예외를 일관된 JSON 으로 변환한다."""
+    # 4xx(클라이언트 잘못)는 WARNING, 5xx(서버 잘못)는 ERROR 로 레벨을 나눈다.
+    if exc.status_code >= 500:
+        logger.error("도메인 예외(5xx): %s", exc.message, exc_info=exc)
+    else:
+        logger.warning("도메인 예외: %s (code=%s)", exc.message, exc.code)
+    return _render(
+        status_code=exc.status_code,
+        code=exc.code,
+        message=exc.message,
+        detail=exc.detail,
+    )
+```
+
+핸들러 함수의 시그니처는 `(request: Request, exc: <예외타입>)` 으로 고정이다. FastAPI 가 매칭되는 예외를 잡아 이 함수에 넘긴다.
+
+- **`AppError` 에 등록** → 자식인 `ResourceNotFound`·`BusinessRuleError` 도 모두 이 핸들러가 처리한다.
+- `exc.status_code`, `exc.code`, `exc.message`, `exc.detail` 을 그대로 `_render` 에 넘긴다.
+- **로그 레벨을 상태 코드로 나눈다.** 4xx 는 "클라이언트가 잘못 보낸 것" 이라 `WARNING`, 5xx 는 "서버가 잘못한 것" 이라 `ERROR`. 운영에서 알림(alert)을 거는 기준이 보통 `ERROR` 이상이라, 이 구분이 중요하다.
+
+### 16.8.2 `HTTPException` 도 같은 모양으로 흡수
+
+직접 `raise HTTPException(...)` 한 곳, 그리고 존재하지 않는 경로(404)·잘못된 메서드(405)처럼 **프레임워크가 자동으로 내는 에러**도 같은 스키마로 통일한다.
+
+```python
+# app/errors.py (이어서)
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """`HTTPException`(과 Starlette 의 404 등)도 같은 에러 모양으로 통일한다.
+
+    이렇게 해두면 직접 `raise HTTPException(...)` 한 곳, 존재하지 않는 경로(404),
+    405 등 프레임워크가 자동으로 내는 에러까지 모두 같은 JSON 스키마로 나간다.
+    """
+    logger.warning("HTTP 예외: %s (status=%s)", exc.detail, exc.status_code)
+    return _render(
+        status_code=exc.status_code,
+        code=f"http_{exc.status_code}",
+        message=str(exc.detail),
+    )
+```
+
+> **왜 `starlette.exceptions.HTTPException` 을 import 하나?** FastAPI 의 `HTTPException` 은 Starlette 의 것을 상속한 것이고, **존재하지 않는 경로(404) 같은 자동 에러는 Starlette 쪽 `HTTPException` 으로 발생**한다. Starlette 의 것에 핸들러를 등록하면 FastAPI 의 것(자식)까지 함께 잡힌다. 그래서 더 넓게 잡는 부모 쪽에 등록한다.
+
+- `code` 는 `http_404`, `http_405` 처럼 상태 코드에서 자동 생성한다.
+- 이제 우리 앱은 **없는 경로로 요청해도** `{"detail": "Not Found"}` 가 아니라 우리의 `{"error": {...}}` 모양으로 응답한다.
+
+### 16.8.3 `RequestValidationError`(422) 커스터마이징
+
+Pydantic 검증이 실패하면 FastAPI 는 기본적으로 `{"detail": [...]}` 모양의 422 를 돌려준다(07장 7.14.4 에서 봤다). 이 모양만 다른 에러와 형태가 다르다. 같은 스키마로 흡수한다.
+
+```python
+# app/errors.py (이어서)
+from fastapi import status
+
+
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """요청 검증 실패(422)를 우리 스키마에 맞게 다듬는다.
+
+    FastAPI 기본 422 응답은 `{"detail": [...]}` 모양이라 다른 에러와 형태가 다르다.
+    여기서 같은 `{"error": {...}}` 스키마로 감싸고, Pydantic 이 준 상세 목록을
+    `detail` 에 그대로 담아 클라이언트가 어느 필드가 틀렸는지 알 수 있게 한다.
+    """
+    logger.warning("검증 실패: %d 건", len(exc.errors()))
+    return _render(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        code="validation_error",
+        message="요청 본문 검증에 실패했습니다",
+        # errors() 안에는 예외 객체 등 JSON 으로 못 바꾸는 값이 섞일 수 있어
+        # jsonable_encoder 로 안전하게 변환한다.
+        detail=jsonable_encoder(exc.errors()),
+    )
+```
+
+- `exc.errors()` 는 Pydantic 이 만든 상세 목록이다. 각 항목에 `loc`(어느 필드), `type`(어떤 검증), `msg`(메시지)가 들어 있다.
+- 그걸 통째로 `detail` 에 담는다. 클라이언트는 `detail[0]["loc"]` 로 어느 필드가 틀렸는지 안다.
+- 바깥 모양(`code`/`message`/`request_id`)은 다른 에러와 똑같다.
+
+이제 422 응답은 이렇게 나간다.
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "요청 본문 검증에 실패했습니다",
+    "detail": [
+      {
+        "type": "less_than_equal",
+        "loc": ["body", "quantity"],
+        "msg": "Input should be less than or equal to 100",
+        "input": 999,
+        "ctx": { "le": 100 }
+      }
+    ],
+    "request_id": "e00e8bedf8c64804ac40c5c4c917cb59"
+  }
+}
+```
+
+### 16.8.4 예상 못 한 예외 → 500 (안전하게)
+
+마지막은 우리가 미처 다루지 못한 모든 예외다. `ValueError`, `KeyError`, DB 끊김 등 무엇이든.
+
+```python
+# app/errors.py (이어서)
+async def unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """그 외 예상 못 한 모든 예외 → 500.
+
+    트레이스백은 서버 로그에만 남기고, 클라이언트에게는 내부 구현을 노출하지
+    않는 일반 메시지만 돌려준다(보안). 대신 `request_id` 를 함께 주므로,
+    사용자가 그 ID 를 알려주면 운영자가 로그에서 정확한 트레이스백을 찾을 수 있다.
+    """
+    logger.error("처리되지 않은 예외", exc_info=exc)
+    return _render(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        code="internal_error",
+        message="서버 내부 오류가 발생했습니다",
+    )
+```
+
+이 핸들러가 **보안의 핵심**이다.
+
+- **`logger.error(..., exc_info=exc)`** — 트레이스백 전체를 **서버 로그에만** 남긴다. `exc_info=exc` 가 트레이스백을 함께 찍는 마법이다(`logger.exception(...)` 과 같은 효과).
+- **클라이언트에게는 일반 메시지만.** `"서버 내부 오류가 발생했습니다"` 만 돌려주고, `ValueError("의도적으로...")` 같은 원문이나 트레이스백은 **절대 노출하지 않는다.** 내부 구현·파일 경로·변수명이 새면 공격자에게 힌트가 된다.
+- **대신 `request_id` 를 준다.** 사용자가 "request_id `1ca4ae...` 에서 에러가 났어요" 라고 알려주면, 운영자는 로그에서 그 ID 로 정확한 트레이스백을 찾는다. 보안과 디버깅 가능성을 동시에 잡는다.
+
+### 16.8.5 핸들러 등록
+
+핸들러들을 앱에 다는 함수다.
+
+```python
+# app/errors.py (맨 끝)
+def register_exception_handlers(app: FastAPI) -> None:
+    """위 핸들러들을 앱에 한꺼번에 등록한다(main.py 에서 한 줄 호출)."""
+    app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+```
+
+> **등록 순서가 중요한가?** FastAPI 는 예외 타입의 **구체성** 으로 매칭한다(가장 잘 맞는 타입). `ResourceNotFound` 가 나면 `AppError` 핸들러가, `RequestValidationError` 가 나면 그 전용 핸들러가, 그 외 전부는 `Exception` 핸들러가 잡는다. `Exception` 은 모든 예외의 부모라 "최후의 그물" 역할을 한다. 등록 순서 자체보다 **타입 계층**이 매칭을 결정한다.
+
+---
+
+## 16.9 요청 ID 미들웨어
+
+이제 요청마다 ID 를 부여하는 미들웨어를 만든다. 이게 로그 상관관계의 출발점이다.
+
+```python
+# app/middleware.py
+import logging
+import uuid
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import ASGIApp
+
+from app.request_context import set_request_id
+
+logger = logging.getLogger("app.request")
+
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp) -> None:
+        super().__init__(app)
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        # 1) 클라이언트가 보낸 ID 를 쓰거나, 없으면 새로 만든다.
+        incoming = request.headers.get(REQUEST_ID_HEADER)
+        request_id = incoming or uuid.uuid4().hex
+
+        # 2) 컨텍스트에 심는다. 이제 이 요청을 처리하는 모든 로그가 이 ID 를 단다.
+        set_request_id(request_id)
+        # 라우터 등에서 request.state.request_id 로도 꺼내 쓸 수 있게 둔다.
+        request.state.request_id = request_id
+
+        logger.info("요청 시작 %s %s", request.method, request.url.path)
+
+        # 3) 다음 단계(다른 미들웨어 → 라우터)를 호출한다.
+        #    예외가 나도 응답 헤더에 ID 를 넣어주기 위해 try/finally 로 감쌀 수도 있지만,
+        #    예외는 예외 핸들러가 만든 JSONResponse 로 변환되어 이 자리로 돌아오므로
+        #    아래 한 줄로 충분하다.
+        response = await call_next(request)
+
+        # 4) 응답 헤더에 같은 ID 를 실어 돌려준다.
+        response.headers[REQUEST_ID_HEADER] = request_id
+
+        logger.info("요청 종료 -> %s", response.status_code)
+        return response
+```
+
+### 16.9.1 미들웨어가 하는 네 가지
+
+번호 주석 그대로다.
+
+1. **ID 결정** — 클라이언트가 `X-Request-ID` 를 보냈으면 그걸 쓰고, 없으면 `uuid.uuid4().hex` 로 새로 만든다.
+2. **컨텍스트에 심기** — `set_request_id(request_id)`. 이 순간부터 이 요청을 처리하는 모든 로그가 이 ID 를 단다(16.5·16.6 의 `ContextVar` + `Filter` 조합 덕분).
+3. **다음 단계 호출** — `await call_next(request)`. 이게 라우터까지 내려갔다 응답을 들고 돌아온다.
+4. **응답 헤더에 ID 반영** — `response.headers[REQUEST_ID_HEADER] = request_id`. 클라이언트도 자기 요청의 ID 를 받는다.
+
+> **왜 클라이언트가 보낸 ID 를 존중하나?** 마이크로서비스 환경에서는 한 사용자 요청이 여러 서비스를 거친다(게이트웨이 → 주문 서비스 → 결제 서비스). 첫 서비스가 만든 ID 를 뒤 서비스들이 **그대로 이어받으면**, 서비스 경계를 넘어도 같은 ID 로 로그를 추적할 수 있다. 이걸 분산 추적(distributed tracing)의 기초라고 한다. 단일 서비스라면 그냥 새로 만들어도 된다.
+
+### 16.9.2 미들웨어와 예외 핸들러의 협력
+
+여기서 한 가지 의문이 든다. **라우터에서 예외가 나면 `call_next` 가 던져서, 4번(헤더 반영)이 실행 안 되는 것 아닌가?**
+
+답은 "아니다". FastAPI/Starlette 에서 **예외 핸들러는 미들웨어보다 안쪽에서 동작**한다. 즉 라우터에서 예외가 나면:
+
+```
+라우터 예외 발생
+  → 예외 핸들러가 잡아 JSONResponse(500/404/...) 로 변환
+  → 그 JSONResponse 가 call_next 의 반환값으로 미들웨어에 올라옴
+  → 미들웨어 4번이 그 응답 헤더에 X-Request-ID 를 붙임
+```
+
+그래서 **에러 응답에도 `X-Request-ID` 가 정상적으로 붙는다.** 본문의 `request_id` 와 헤더의 `X-Request-ID` 가 항상 일치한다. (이건 뒤 16.11 테스트에서 직접 검증한다.)
+
+> **`@app.middleware("http")` 데코레이터 방식과 다른가?** 12장 12.35 에서 본 `@app.middleware("http")` 는 `BaseHTTPMiddleware` 를 더 짧게 쓰는 문법 설탕이다. 동작은 같다. 우리는 클래스로 분리해 `main.py` 를 깔끔하게 두는 쪽을 택했다. 둘 중 편한 것을 쓰면 된다.
+
+---
+
+## 16.10 `app/main.py` — 조립과 시연 엔드포인트
+
+부품을 다 만들었으니 조립한다.
+
+```python
+# app/main.py
+import logging
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+from app.errors import BusinessRuleError, ResourceNotFound, register_exception_handlers
+from app.logging_config import setup_logging
+from app.middleware import RequestIdMiddleware
+
+# 앱이 import 되는 시점에 로깅을 한 번 설정한다.
+setup_logging(level=logging.INFO)
+logger = logging.getLogger("app.main")
+
+app = FastAPI(
+    title="Error Logging Example",
+    version="0.1.0",
+    description="16장 — 커스텀 예외, 일관된 에러 응답, 요청 ID 미들웨어, 표준 logging.",
+)
+
+# 미들웨어 등록. add_middleware 로 붙인 것은 "가장 나중에 추가한 것이 가장 바깥"이다.
+# 요청 ID 는 모든 처리의 가장 바깥에서 부여돼야 하므로 여기 한 줄이면 충분하다.
+app.add_middleware(RequestIdMiddleware)
+
+# 전역 예외 핸들러 등록(errors.py 의 핸들러 묶음).
+register_exception_handlers(app)
+
+
+# 학습용 인메모리 "DB". 실제 앱이라면 06~07장처럼 SQLAlchemy 가 들어온다.
+ITEMS: dict[int, dict] = {
+    1: {"id": 1, "name": "노트북", "stock": 3},
+    2: {"id": 2, "name": "키보드", "stock": 0},
+}
+
+
+class OrderRequest(BaseModel):
+    """주문 요청 본문. 검증 에러를 시연하기 위해 제약을 건다."""
+
+    item_id: int = Field(ge=1, description="주문할 상품 ID (1 이상)")
+    quantity: int = Field(ge=1, le=100, description="수량 (1~100)")
+
+
+@app.get("/health", tags=["meta"], summary="헬스 체크")
+async def health() -> dict[str, str]:
+    """살아 있는지 확인하는 정상 응답 엔드포인트."""
+    return {"status": "ok"}
+
+
+@app.get("/items/{item_id}", tags=["items"], summary="단건 조회(정상/404 시연)")
+async def get_item(item_id: int) -> dict:
+    """있으면 정상 200, 없으면 커스텀 예외 `ResourceNotFound` → 일관된 404 JSON."""
+    item = ITEMS.get(item_id)
+    if item is None:
+        # HTTPException 대신 도메인 예외를 던진다. 변환은 전역 핸들러가 맡는다.
+        raise ResourceNotFound("item", item_id)
+    return item
+
+
+@app.post("/orders", tags=["orders"], summary="주문(검증/비즈니스 규칙 시연)")
+async def create_order(payload: OrderRequest) -> dict:
+    """주문을 시도한다.
+
+    - 본문 검증 실패(item_id<1, quantity 범위 밖 등) → 422 (검증 핸들러가 처리).
+    - 없는 상품 → 404 (`ResourceNotFound`).
+    - 재고 부족 → 409 (`BusinessRuleError`).
+    - 정상 → 201 처럼 동작(여기서는 200 으로 단순화).
+    """
+    item = ITEMS.get(payload.item_id)
+    if item is None:
+        raise ResourceNotFound("item", payload.item_id)
+
+    if payload.quantity > item["stock"]:
+        # 비즈니스 규칙 위반. detail 에 부가 정보를 실어 보낸다.
+        raise BusinessRuleError(
+            "재고가 부족합니다",
+            detail={"requested": payload.quantity, "in_stock": item["stock"]},
+        )
+
+    logger.info("주문 성공 item_id=%s quantity=%s", payload.item_id, payload.quantity)
+    return {
+        "ordered": True,
+        "item_id": payload.item_id,
+        "quantity": payload.quantity,
+    }
+
+
+@app.get("/boom", tags=["demo"], summary="예상 못 한 예외 시연(500)")
+async def boom() -> dict:
+    """일부러 평범한 예외를 던져 500 핸들러를 시연한다.
+
+    클라이언트에게는 일반 메시지 + request_id 만, 서버 로그에는 트레이스백이 남는다.
+    """
+    raise ValueError("의도적으로 발생시킨 내부 오류")
+```
+
+조립 순서를 한 번 더 짚자.
+
+1. **`setup_logging(...)` 을 맨 먼저** — 앱·미들웨어가 첫 로그를 찍기 전에 로깅이 준비돼야 한다.
+2. **`app.add_middleware(RequestIdMiddleware)`** — 요청 ID 미들웨어 한 줄. `add_middleware` 는 "나중에 추가한 것이 가장 바깥" 이라, 미들웨어가 여럿이면 요청 ID 를 **가장 마지막에** 추가해 가장 바깥에 둔다(가장 먼저 ID 를 부여하도록).
+3. **`register_exception_handlers(app)`** — 핸들러 묶음 등록 한 줄.
+
+> **시연 엔드포인트의 의도** : `/items/{id}` 는 정상/404 를, `/orders` 는 검증(422)/없음(404)/규칙위반(409)/정상을, `/boom` 은 500 을 각각 보여준다. 한 엔드포인트가 한 가지 에러 경로를 또렷하게 시연하도록 일부러 단순하게 짰다.
+
+---
+
+## 16.11 통합 테스트
+
+라우터가 정말 일관된 에러를 내는지, 요청 ID 가 제대로 붙는지 자동으로 검증한다. 07·13장과 같은 `pytest` + `httpx.AsyncClient` 패턴이다.
+
+### 16.11.1 `tests/conftest.py`
+
+```python
+# tests/conftest.py
+from collections.abc import AsyncGenerator
+
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+
+@pytest_asyncio.fixture
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+```
+
+DB 가 없으니 픽스처는 클라이언트 하나뿐이다. 한 가지만 07장과 다르다.
+
+> **`raise_app_exceptions=False` 가 왜 필요한가?** `ASGITransport` 의 기본값(`True`)이면, 앱에서 처리되지 못한 예외를 **테스트 클라이언트가 그대로 다시 던진다.** 우리는 500 핸들러가 만든 **JSON 응답 자체**(실제 서버가 클라이언트에게 보내는 것과 같은 응답)를 검증하고 싶다. 그래서 이 옵션을 꺼서 예외 대신 500 응답을 받는다. `/boom` 테스트가 이 옵션 없이는 실패한다.
+
+### 16.11.2 `tests/test_errors.py`
+
+테스트 함수 이름이 곧 사양이 되도록 한국어로 적는다. 먼저 **에러 스키마를 검증하는 헬퍼** 를 둔다(모든 에러가 같은 모양인지 한 곳에서 확인).
+
+```python
+# tests/test_errors.py (일부)
+from httpx import AsyncClient
+
+from app.middleware import REQUEST_ID_HEADER
+
+
+def assert_error_shape(body: dict) -> dict:
+    """에러 응답이 일관된 스키마를 따르는지 확인하고, error 본문을 돌려준다.
+
+    모양: {"error": {"code": str, "message": str, "detail": ..., "request_id": str}}
+    """
+    assert set(body.keys()) == {"error"}
+    err = body["error"]
+    assert set(err.keys()) == {"code", "message", "detail", "request_id"}
+    assert isinstance(err["code"], str) and err["code"]
+    assert isinstance(err["message"], str) and err["message"]
+    assert isinstance(err["request_id"], str) and err["request_id"]
+    return err
+```
+
+이제 케이스들이다. 정상·커스텀 예외·검증·500·요청 ID 를 묶음별로 나눈다.
+
+```python
+class TestHealthyResponses:
+    async def test_헬스_체크는_정상_200(self, client: AsyncClient) -> None:
+        res = await client.get("/health")
+        assert res.status_code == 200
+        assert res.json() == {"status": "ok"}
+
+    async def test_존재하는_상품_조회는_200(self, client: AsyncClient) -> None:
+        res = await client.get("/items/1")
+        assert res.status_code == 200
+        assert res.json()["name"] == "노트북"
+
+    async def test_정상_주문은_성공_본문을_돌려준다(self, client: AsyncClient) -> None:
+        res = await client.post("/orders", json={"item_id": 1, "quantity": 2})
+        assert res.status_code == 200
+        assert res.json()["ordered"] is True
+
+
+class TestCustomException:
+    async def test_없는_상품_조회는_커스텀_404와_일관된_스키마(
+        self, client: AsyncClient
+    ) -> None:
+        res = await client.get("/items/9999")
+        assert res.status_code == 404
+        err = assert_error_shape(res.json())
+        assert err["code"] == "resource_not_found"
+        assert err["detail"]["resource"] == "item"
+
+    async def test_재고_부족_주문은_비즈니스_규칙_409(
+        self, client: AsyncClient
+    ) -> None:
+        # 2번 상품은 재고 0. 1개라도 주문하면 규칙 위반.
+        res = await client.post("/orders", json={"item_id": 2, "quantity": 1})
+        assert res.status_code == 409
+        err = assert_error_shape(res.json())
+        assert err["code"] == "business_rule_violation"
+        assert err["detail"]["in_stock"] == 0
+
+
+class TestValidationError:
+    async def test_수량이_범위를_벗어나면_422_일관된_스키마(
+        self, client: AsyncClient
+    ) -> None:
+        res = await client.post("/orders", json={"item_id": 1, "quantity": 999})
+        assert res.status_code == 422
+        err = assert_error_shape(res.json())
+        assert err["code"] == "validation_error"
+        # detail 에는 Pydantic 이 준 상세 목록이 그대로 들어 있다.
+        locs = [tuple(item["loc"]) for item in err["detail"]]
+        assert ("body", "quantity") in locs
+
+    async def test_없는_경로는_404도_같은_에러_스키마(
+        self, client: AsyncClient
+    ) -> None:
+        # 라우트가 없는 경로 → Starlette 의 404. HTTPException 핸들러가 통일한다.
+        res = await client.get("/no-such-path")
+        assert res.status_code == 404
+        assert assert_error_shape(res.json())["code"] == "http_404"
+
+
+class TestUnhandledException:
+    async def test_예상_못_한_예외는_500이지만_내부를_노출하지_않는다(
+        self, client: AsyncClient
+    ) -> None:
+        res = await client.get("/boom")
+        assert res.status_code == 500
+        err = assert_error_shape(res.json())
+        assert err["code"] == "internal_error"
+        # 트레이스백·예외 메시지 원문이 그대로 새지 않아야 한다(보안).
+        assert "ValueError" not in err["message"]
+        assert err["request_id"] != "-"
+
+
+class TestRequestId:
+    async def test_에러_응답에도_X_Request_ID_헤더가_있다(
+        self, client: AsyncClient
+    ) -> None:
+        res = await client.get("/items/9999")
+        assert REQUEST_ID_HEADER in res.headers
+        # 헤더의 ID 와 본문의 request_id 가 같아야 한다(상관관계).
+        assert res.headers[REQUEST_ID_HEADER] == res.json()["error"]["request_id"]
+
+    async def test_클라이언트가_보낸_요청_ID가_그대로_전파된다(
+        self, client: AsyncClient
+    ) -> None:
+        my_id = "test-correlation-id-123"
+        res = await client.get("/health", headers={REQUEST_ID_HEADER: my_id})
+        assert res.headers[REQUEST_ID_HEADER] == my_id
+
+    async def test_보내지_않으면_매_요청마다_다른_ID가_생성된다(
+        self, client: AsyncClient
+    ) -> None:
+        r1 = await client.get("/health")
+        r2 = await client.get("/health")
+        assert r1.headers[REQUEST_ID_HEADER] != r2.headers[REQUEST_ID_HEADER]
+```
+
+전체 파일은 예제 폴더의 `tests/test_errors.py` 에 있고, 총 14개 케이스를 포함한다(정상 3 + 커스텀 예외 3 + 검증 3 + 500 1 + 요청 ID 4).
+
+### 16.11.3 실행
+
+```bash
+uv run pytest -q
+```
+
+성공하면 다음과 비슷한 출력이 나온다.
+
+```
+..............                                                           [100%]
+14 passed in 0.03s
+```
+
+> **`X-Request-ID` 검증이 핵심** : `test_에러_응답에도_X_Request_ID_헤더가_있다` 는 16.9.2 에서 설명한 "에러가 나도 미들웨어가 헤더를 붙인다" 를 실제로 증명한다. 헤더의 ID 와 본문의 `request_id` 가 일치하는지까지 확인한다.
+
+---
+
+## 16.12 서버 띄우고 직접 호출해 보기
+
+테스트를 통과했다면 실제 서버도 띄워서 눌러 보자.
+
+```bash
+uv run uvicorn app.main:app --reload
+```
+
+### 16.12.1 정상 응답
+
+```bash
+curl -i http://127.0.0.1:8000/items/1
+```
+
+응답 헤더에 `X-Request-ID` 가 보이고, 본문은 200 이다.
+
+```
+HTTP/1.1 200 OK
+x-request-id: c9a52aac80324bac951b134d8c26e11e
+content-type: application/json
+
+{"id":1,"name":"노트북","stock":3}
+```
+
+### 16.12.2 커스텀 404
+
+```bash
+curl http://127.0.0.1:8000/items/9999
+```
+
+```json
+{
+  "error": {
+    "code": "resource_not_found",
+    "message": "item 9999 를 찾을 수 없습니다",
+    "detail": { "resource": "item", "id": 9999 },
+    "request_id": "ae510f2727354c37a1bdecbca61e2033"
+  }
+}
+```
+
+### 16.12.3 검증 실패 (422)
+
+```bash
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -d '{"item_id": 1, "quantity": 999}'
+```
+
+`detail` 에 Pydantic 상세 목록이 담긴 422 가 나온다(16.8.3 의 JSON 과 동일).
+
+### 16.12.4 비즈니스 규칙 위반 (409)
+
+```bash
+# 2번 상품은 재고 0
+curl -X POST http://127.0.0.1:8000/orders \
+  -H "Content-Type: application/json" \
+  -d '{"item_id": 2, "quantity": 1}'
+```
+
+```json
+{
+  "error": {
+    "code": "business_rule_violation",
+    "message": "재고가 부족합니다",
+    "detail": { "requested": 1, "in_stock": 0 },
+    "request_id": "004468d77d4b43659a16bacb17193b3c"
+  }
+}
+```
+
+### 16.12.5 내부 오류 (500)
+
+```bash
+curl http://127.0.0.1:8000/boom
+```
+
+클라이언트가 받는 응답에는 **내부 구현이 없다**.
+
+```json
+{
+  "error": {
+    "code": "internal_error",
+    "message": "서버 내부 오류가 발생했습니다",
+    "detail": null,
+    "request_id": "1ca4ae9a08a647f4aa3dd63ebe1adade"
+  }
+}
+```
+
+반면 **서버 콘솔** 에는 같은 `request_id` 로 트레이스백이 통째로 남는다.
+
+```
+2026-06-24 11:55:57 [ERROR] app.errors [req=1ca4ae9a...] 처리되지 않은 예외
+Traceback (most recent call last):
+  ...
+  File ".../app/main.py", line 112, in boom
+    raise ValueError("의도적으로 발생시킨 내부 오류")
+ValueError: 의도적으로 발생시킨 내부 오류
+```
+
+사용자가 `request_id` 만 알려주면 운영자가 로그에서 정확히 이 트레이스백을 찾는다. **보안(노출 안 함)과 디버깅(추적 가능)을 동시에** 잡았다.
+
+### 16.12.6 요청 ID 전파
+
+```bash
+curl -i http://127.0.0.1:8000/health -H "X-Request-ID: my-trace-1"
+```
+
+응답 헤더의 `x-request-id` 가 보낸 값 그대로 `my-trace-1` 이다.
+
+### 16.12.7 로그 상관관계 확인
+
+서버 콘솔을 보면 한 요청의 모든 로그가 같은 `[req=...]` 로 묶여 있다.
+
+```
+2026-06-24 11:55:57 [INFO] app.request [req=ae510f27...] 요청 시작 GET /items/9999
+2026-06-24 11:55:57 [WARNING] app.errors [req=ae510f27...] 도메인 예외: item 9999 를 찾을 수 없습니다 (code=resource_not_found)
+2026-06-24 11:55:57 [INFO] app.request [req=ae510f27...] 요청 종료 -> 404
+```
+
+`app.request`(미들웨어)와 `app.errors`(핸들러)가 **서로 다른 모듈**인데도 같은 ID 로 묶인다. 16.5·16.6 의 `ContextVar` + `Filter` 조합이 만든 결과다. 운영에서 로그가 수만 줄이 쌓여도, 이 ID 하나로 한 요청의 흐름만 뽑아낼 수 있다.
+
+---
+
+## 16.13 구조적 로깅 개념 — structlog 는 언제
+
+지금 우리 로그는 **한 줄짜리 자유 형식 문자열** 이다.
+
+```
+2026-06-24 11:55:57 [WARNING] app.errors [req=ae510f27...] 도메인 예외: item 9999 를 찾을 수 없습니다 (code=resource_not_found)
+```
+
+사람이 읽기엔 좋다. 그런데 운영에서 로그를 **검색·집계** 하기 시작하면 한계가 온다. "code 가 resource_not_found 인 로그만", "req=ae510f27 인 로그만" 을 뽑으려면 문자열 파싱을 해야 한다.
+
+**구조적 로깅(structured logging)** 은 로그를 문장이 아니라 **키-값 쌍(보통 JSON)** 으로 남기는 방식이다.
+
+```json
+{"timestamp": "2026-06-24T11:55:57", "level": "warning", "logger": "app.errors", "request_id": "ae510f27...", "event": "도메인 예외", "code": "resource_not_found"}
+```
+
+이러면 로그 수집 시스템(Elasticsearch, Loki, CloudWatch 등)이 `code` 필드로 바로 검색·집계·알림을 건다. 컨테이너(Docker·쿠버네티스) 환경에서 거의 필수에 가깝다.
+
+이걸 가장 쉽게 해주는 라이브러리가 **structlog** 다. 설치·설정은 **12장 12.36 절**에 정리돼 있다. 핵심만 옮기면:
+
+```python
+import structlog
+
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ]
+)
+log = structlog.get_logger()
+log.warning("도메인 예외", code="resource_not_found", request_id="...")
+```
+
+> **그럼 이 장의 표준 `logging` 은 버려야 하나?** 아니다. ① 표준 `logging` 만으로도 이 장에서 본 것처럼 **충분히 깔끔하게** 갈 수 있다. 입문·소규모에서는 이게 정답이다. ② structlog 도 결국 표준 `logging` 위에서 동작하도록 결합하는 게 일반적이라, **이 장에서 배운 핸들러·필터·포매터 개념이 그대로 쓰인다.** 표준 `logging` 을 먼저 손에 익히는 게 순서다. ③ 요청 ID 를 `ContextVar` 로 다루는 패턴은 structlog 의 `contextvars` 연동(`structlog.contextvars.bind_contextvars`)과도 거의 같은 발상이다.
+
+요약하면, **개념은 같고 출력 형식만 다르다.** 한 줄 텍스트로 시작하고, 로그를 기계로 분석할 필요가 생기면 structlog(또는 표준 `logging` 의 JSON 포매터)로 옮기면 된다.
+
+---
+
+## 16.14 흔한 실수 / 트러블슈팅
+
+### 16.14.1 로그가 두 번씩 찍힌다
+
+`setup_logging` 이 여러 번 불려 핸들러가 쌓였다. 16.6.4 처럼 기존 핸들러를 떼고 붙이거나, `basicConfig` 를 쓴다면 한 번만 호출되도록 한다. `--reload` 개발 중에 특히 잘 생긴다.
+
+### 16.14.2 `KeyError: 'request_id'` 로 로그가 깨진다
+
+포매터에 `%(request_id)s` 를 썼는데 `RequestIdFilter` 를 핸들러에 안 붙였다. 필터가 모든 레코드에 `request_id` 속성을 채워줘야 포맷이 성립한다. 필터를 **핸들러** 에 붙였는지 확인(`handler.addFilter(...)`).
+
+### 16.14.3 에러 응답이 여전히 `{"detail": ...}` 모양이다
+
+핸들러를 등록 안 했거나, 잘못된 예외 타입에 등록했다.
+
+- `RequestValidationError` 핸들러는 `fastapi.exceptions.RequestValidationError` 에 등록해야 한다.
+- 404·405 자동 에러까지 잡으려면 `starlette.exceptions.HTTPException`(FastAPI 의 것이 아니라 **Starlette** 의 것)에 등록해야 한다.
+
+### 16.14.4 `/boom` 테스트만 예외를 다시 던지며 실패한다
+
+`ASGITransport(app=app)` 의 기본값이 `raise_app_exceptions=True` 라, 처리 안 된 예외를 테스트가 다시 던진다. 16.11.1 처럼 `raise_app_exceptions=False` 를 준다.
+
+### 16.14.5 500 응답에 트레이스백/내부 메시지가 노출된다
+
+`unhandled_exception_handler` 가 `str(exc)` 를 응답 `message` 에 넣고 있지 않은지 확인. **클라이언트 응답에는 일반 문구만**, 트레이스백은 `logger.error(..., exc_info=exc)` 로 **로그에만** 남긴다(16.8.4).
+
+### 16.14.6 비동기에서 요청 ID 가 가끔 뒤섞인다
+
+평범한 모듈 전역 변수에 요청 ID 를 저장하면 동시 요청끼리 덮어쓴다. 반드시 `contextvars.ContextVar` 를 쓴다(16.5). 그리고 미들웨어의 `dispatch` 안에서 `set_request_id` 를 호출해야 같은 비동기 컨텍스트에 심긴다.
+
+### 16.14.7 `DEBUG` 레벨을 운영에서 켜둬 로그가 폭주한다
+
+`setup_logging(level=...)` 의 레벨을 환경 변수로 제어하자(예: 개발 `DEBUG`, 운영 `INFO`). 12장 12.35 의 함정과 같은 맥락이다.
+
+---
+
+## 16.15 이 챕터 요약
+
+- **커스텀 예외 + 전역 핸들러** : 도메인 상황을 예외 타입(`ResourceNotFound`, `BusinessRuleError`)으로 표현하고, 부모 `AppError` 에 핸들러 하나만 등록해 자식 전부를 일관 처리한다. "라우터는 `raise` 만, 변환은 핸들러가 한 곳에서."
+- **일관된 에러 스키마** : 모든 에러가 `{"error": {code, message, detail, request_id}}` 한 모양으로 나간다. `HTTPException`·검증 에러(422)·예상 못 한 500 까지 전부 같은 스키마로 흡수한다. 기계용 `code` 와 사람용 `message` 를 분리한다.
+- **`RequestValidationError` 커스터마이징** : 기본 `{"detail": [...]}` 를 우리 스키마로 감싸되, Pydantic 의 상세 목록은 `detail` 에 그대로 담아 어느 필드가 틀렸는지 알 수 있게 한다.
+- **요청 ID 미들웨어** : `uuid` 로(또는 클라이언트가 보낸 값으로) `X-Request-ID` 를 부여하고, `ContextVar` 에 심어 로그에 싣고, 응답 헤더로 돌려준다. 에러 응답에도 헤더가 붙는다.
+- **로그 상관관계** : `ContextVar`(요청 ID 보관) + `logging.Filter`(모든 레코드에 ID 주입) + 포매터의 `%(request_id)s` 조합으로, 서로 다른 모듈의 로그가 한 요청 ID 로 묶인다.
+- **표준 logging** : 포매터·핸들러·필터·레벨을 한 함수로 설정한다. 500 의 트레이스백은 `exc_info=exc` 로 **로그에만** 남기고 클라이언트에는 노출하지 않는다(보안 + 디버깅 가능성).
+- **구조적 로깅** 은 같은 개념의 다음 단계다. 로그를 기계로 검색·집계할 필요가 생기면 structlog(12장 12.36) 또는 JSON 포매터로 옮긴다. 이 장에서 배운 핸들러·필터 개념이 그대로 재사용된다.
+
+---
+
+← [15. 백그라운드 작업](15-background-tasks.md) | [README로 돌아가기](../README.md) | 다음 문서로 이동: **[용어 사전 →](glossary.md)**
 
 <a id="glossary"></a>
 
