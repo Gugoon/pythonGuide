@@ -144,7 +144,7 @@ async def test_me_with_tampered_token_returns_401(client: AsyncClient) -> None:
     """변조된 토큰은 서명 검증 실패 → 401."""
     bogus = jwt.encode(
         {"sub": "999", "iat": 0, "exp": 9999999999},
-        "definitely-not-the-real-secret",
+        "wrong-secret-but-at-least-32-bytes-long-000",
         algorithm="HS256",
     )
     r = await client.get(

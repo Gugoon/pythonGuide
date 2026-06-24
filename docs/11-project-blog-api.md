@@ -106,10 +106,10 @@
 | Alembic | 1.13+ | 마이그레이션 |
 | **asyncmy** | 0.2+ | **MySQL 비동기 드라이버** (10장의 PostgreSQL `asyncpg` 자리) |
 | PyJWT | 2.8+ | 인증 |
-| bcrypt | 4.x | 비밀번호 해싱 (직접 사용) |
+| bcrypt | 5.x | 비밀번호 해싱 (직접 사용) |
 | python-slugify | 8.x | 제목 → URL slug |
 | Uvicorn | 0.30+ | 개발 서버 |
-| Gunicorn | 23.x | 운영 |
+| Gunicorn | 23.x (선택) | 운영(graceful reload 필요 시). 기본은 Uvicorn 멀티워커 |
 | Docker / Docker Compose | latest | MySQL + 앱 통합 실행 |
 | MySQL | 8.4 LTS | DB |
 | uv | 0.4+ | 패키지·가상환경 |
@@ -127,7 +127,7 @@
 ```
 11-BlogAPI/
 ├── pyproject.toml
-├── uv.lock
+├── uv.lock                # 첫 `uv sync` 시 생성됨 — 저장소에 커밋 권장
 ├── .python-version
 ├── .env.example
 ├── .gitignore
@@ -2037,7 +2037,7 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "2", \
-     "--proxy-headers", "--forwarded-allow-ips=*"]
+     "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]
 ```
 
 > **멀티스테이지 빌드란?** 한 Dockerfile 안에 여러 빌드 단계를 두고, 마지막 단계에 필요한 결과물만 가져가는 방식입니다. 빌드 도구(uv, 컴파일러 등)는 최종 이미지에 들어가지 않아 이미지 크기가 작아지고, 보안 표면도 줄어듭니다.
@@ -2479,7 +2479,7 @@ curl -i -X PATCH "http://127.0.0.1:8000/posts/$POST_ID" \
 ### 11.25.2 Render
 
 - **MySQL은 별도 호스팅 또는 Render의 Private Service**(Render 자체는 PostgreSQL이 더 강함). MySQL을 외부에 둘 거면 PlanetScale·Aiven·AWS RDS 등을 검토.
-- 앱은 **Web Service**로 배포. 빌드 명령은 `uv sync --frozen --no-dev`, 시작 명령은 `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2 --proxy-headers --forwarded-allow-ips='*'`.
+- 앱은 **Web Service**로 배포. 빌드 명령은 `uv sync --no-dev`(저장소에 `uv.lock`을 커밋했다면 `uv sync --frozen --no-dev` 권장), 시작 명령은 `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2 --proxy-headers --forwarded-allow-ips='*'`(Render 프록시 뒤이므로 신뢰 대역을 `'*'`로 둔다 — 컨테이너를 외부에 직접 노출한다면 좁힐 것).
 - 환경 변수에 `DATABASE_URL`, `SECRET_KEY` 입력.
 - 마이그레이션은 **Job** 또는 배포 스크립트에서 `alembic upgrade head`.
 

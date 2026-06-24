@@ -4,7 +4,7 @@
 > - 06장에서 익힌 SQLAlchemy 흐름을 한 단계 끌어올려, **라우터 분리·서비스 레이어·통합 테스트**가 갖춰진 작은 실전 API 를 처음부터 끝까지 만든다.
 > - `APIRouter` 로 도메인별 엔드포인트를 묶고, `crud.py` 로 비즈니스 로직을 분리하는 표준 구조를 손에 익힌다.
 > - HTTP 상태 코드(201 / 204 / 404)와 부분 수정(PATCH) 의 표준 패턴, `model_dump(exclude_unset=True)` 의 활용을 익힌다.
-> - `pytest` + `httpx.AsyncClient` + 의존성 오버라이드로 통합 테스트 8~10개를 작성하고, `uv run pytest` 한 줄로 자동 실행한다.
+> - `pytest` + `httpx.AsyncClient` + 의존성 오버라이드로 통합 테스트 17개를 작성하고, `uv run pytest` 한 줄로 자동 실행한다.
 > - Alembic 으로 첫 마이그레이션 파일을 생성·적용하는 흐름을 마무리한다.
 
 > **소요 시간**: 3~5시간

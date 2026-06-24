@@ -26,9 +26,9 @@ Compose 환경을 함께 제공한다. 본문은 [docs/10-project-note-api.md](.
 | asyncpg | 0.29+ | PostgreSQL 비동기 드라이버 |
 | aiosqlite | 0.20+ | 테스트용 SQLite 비동기 드라이버 |
 | PyJWT | 2.8+ | JWT 발급·검증 |
-| bcrypt | 4.x | 비밀번호 해싱 (직접 사용) |
+| bcrypt | 5.x | 비밀번호 해싱 (직접 사용) |
 | Uvicorn | 0.30+ | 개발 ASGI 서버 |
-| Gunicorn | 22+ | 운영 프로세스 매니저 |
+| Gunicorn | 22+ (선택) | graceful reload 등이 필요할 때만 (기본은 Uvicorn 멀티워커) |
 | uv | 0.4+ | 패키지/가상환경 관리 |
 
 ## 빠른 실행
@@ -160,7 +160,7 @@ uv run pytest -v
 ```
 10-NoteAPI/
 ├── pyproject.toml
-├── uv.lock
+├── uv.lock                # 첫 `uv sync` 시 생성됨 — 저장소에 커밋 권장
 ├── .python-version
 ├── .env.example
 ├── .gitignore

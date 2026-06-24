@@ -13,9 +13,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
-# 락 파일 기준으로 의존성을 먼저 설치 (소스 변경에도 캐시 활용)
+# 락 파일 기준으로 의존성을 먼저 설치 (소스 변경에도 캐시 활용).
+# uv.lock 이 있으면 --frozen 으로 정확히 그 버전을, 없으면 폴백해서 최신 호환 버전을 받는다.
+# (저장소에 uv.lock 을 커밋해 두면 재현성이 가장 좋다 — `uv lock` 으로 생성.)
 COPY pyproject.toml uv.lock* ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev || uv sync --no-dev
 
 # 앱 소스 복사
 COPY app ./app
@@ -49,8 +51,10 @@ EXPOSE 8000
 # 옛 `gunicorn -k uvicorn.workers.UvicornWorker` 패턴은 deprecated 되어 별도
 # 패키지(`uvicorn-worker`)로 분리됐습니다. Gunicorn 의 graceful reload 가 꼭
 # 필요하면 `uv add uvicorn-worker` 후 `-k uvicorn_worker.UvicornWorker` 로.
+# forwarded-allow-ips 기본은 127.0.0.1(같은 호스트의 프록시만 신뢰). 외부 프록시
+# (Render·Fly 등) 뒤에 둘 땐 신뢰 대역(프록시 IP/서브넷, 또는 '*')으로 넓힌다.
 # 개발에서는 docker-compose의 command를 uvicorn --reload 로 덮어쓴다.
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "2", \
-     "--proxy-headers", "--forwarded-allow-ips=*"]
+     "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]

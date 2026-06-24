@@ -61,8 +61,10 @@ USER app
 EXPOSE 8000
 
 # 운영용 기본 실행 — Uvicorn 자체 멀티워커 + proxy-headers.
+# forwarded-allow-ips 기본은 127.0.0.1(같은 호스트의 프록시만 신뢰). Render·Fly 등
+# 외부 프록시 뒤에 둘 땐 신뢰 대역(프록시 IP/서브넷, 또는 '*')으로 넓힌다.
 # 개발 시에는 docker-compose에서 command를 uvicorn --reload로 덮어쓴다.
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "4", \
-     "--proxy-headers", "--forwarded-allow-ips=*"]
+     "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]

@@ -22,13 +22,16 @@ def create_app() -> FastAPI:
     )
 
     # CORS — 프론트엔드가 다른 도메인일 때 브라우저의 차단을 풀어준다.
+    # 이 예제는 JWT 를 Authorization 헤더로 주고받으므로 allow_credentials 가 필요 없다.
+    # 주의: allow_origins=["*"] 와 allow_credentials=True 는 CORS 규약상 함께 쓸 수 없다.
+    #       (쿠키 기반 인증으로 바꾸려면 allow_origins 에 실제 도메인을 명시해야 한다.)
     # 운영에서는 ["*"] 대신 실제 도메인 목록을 명시할 것.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
     )
 
     app.include_router(auth_router.router)

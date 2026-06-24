@@ -81,7 +81,7 @@ curl -X POST http://127.0.0.1:8000/quotes/ \
   "text": "Stay hungry, stay foolish.",
   "author": "Steve Jobs",
   "id": 1,
-  "created_at": "2026-04-25T10:30:00.123456+00:00"
+  "created_at": "2026-04-25T10:30:00.123456Z"
 }
 ```
 

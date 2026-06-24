@@ -45,7 +45,7 @@ services:
     ports:
       - "8000:8000"
     # 개발 중에는 uvicorn --reload 로 덮어 쓴다.
-    # 운영에서는 Dockerfile의 기본 CMD(gunicorn) 그대로 둔다.
+    # 운영에서는 Dockerfile의 기본 CMD(uvicorn 멀티워커) 그대로 둔다.
     command:
       - "uvicorn"
       - "app.main:app"

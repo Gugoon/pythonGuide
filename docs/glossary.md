@@ -53,6 +53,8 @@
 - `/users/42` — **경로(path)**: 어떤 자원을 가리키는지
 - `?format=json` — **쿼리 스트링(query string)**: 추가 옵션. `key=value` 형태로 여러 개를 `&`로 이음
 
+> **URI vs URL**: URI는 자원을 식별하는 이름의 총칭이고, URL은 그 자원의 *위치*(스킴+호스트+경로)까지 담은 URI입니다. 실무에서는 보통 URL로 통일해 부릅니다(02장 2.4 절 참고).
+
 ### 요청 헤더 / 응답 헤더 (Headers)
 
 본문(body)과 별개로 붙는 메타 정보입니다. `Content-Type: application/json`(본문은 JSON이다), `Authorization: Bearer xxx`(이게 내 인증 토큰이다) 같은 것들이 헤더입니다.
@@ -378,7 +380,7 @@ FastAPI 앱을 실제로 실행해 주는 ASGI 서버. 개발용으로는 `uvico
 
 ### Gunicorn
 
-여러 워커 프로세스로 ASGI 앱을 굴려 주는 운영용 프로세스 매니저. 본 가이드 기준 권장은 **Uvicorn 자체 멀티워커**(`uvicorn ... --workers N --proxy-headers`)이고, Gunicorn 의 graceful reload 등이 꼭 필요할 때만 별도 패키지 `uvicorn-worker` 를 추가해 `gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 4` 형태로 씁니다(옛 `uvicorn.workers.UvicornWorker` 는 deprecated 되어 0.31 에서 분리됐습니다).
+여러 워커 프로세스로 ASGI 앱을 굴려 주는 운영용 프로세스 매니저. 본 가이드 기준 권장은 **Uvicorn 자체 멀티워커**(`uvicorn ... --workers N --proxy-headers`)이고, Gunicorn 의 graceful reload 등이 꼭 필요할 때만 별도 패키지 `uvicorn-worker` 를 추가해 `gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 4` 형태로 씁니다(옛 `uvicorn.workers.UvicornWorker` 는 0.30 부터 deprecated 되어 별도 패키지 `uvicorn-worker` 로 분리됐습니다).
 
 ### uv
 

@@ -18,10 +18,10 @@ pip-delete-this-directory.txt
 venv/
 env/
 ENV/
-.python-version
 
 ### uv
 .uv/
+# uv.lock 은 커밋 권장(재현성). .python-version 도 프로젝트 Python 버전 고정용으로 커밋한다.
 
 ### 테스트 / 캐시
 .pytest_cache/

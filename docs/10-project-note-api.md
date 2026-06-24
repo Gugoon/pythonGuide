@@ -12,7 +12,7 @@
 
 > **만들 것**: "내 메모만 쓰고 읽을 수 있는" 작은 백엔드. 스마트폰 메모 앱의 서버 부분이라고 생각하면 됩니다.
 
-> **사용 스택**: Python 3.13 / FastAPI 0.115+ / Pydantic 2.x / SQLAlchemy 2.0 (async) + Alembic / PyJWT / **bcrypt 직접 사용** / PostgreSQL + Docker Compose / Uvicorn(개발) + Gunicorn(운영) / **uv**
+> **사용 스택**: Python 3.13 / FastAPI 0.115+ / Pydantic 2.x / SQLAlchemy 2.0 (async) + Alembic / PyJWT / **bcrypt 직접 사용** / PostgreSQL + Docker Compose / Uvicorn 자체 멀티워커(운영) / Gunicorn(선택) / **uv**
 
 > **참고**: 03~09장에서 다룬 내용 중 일부를 일부러 다시 짚습니다. 한 챕터만 봐도 실행되는 결과물이 손에 남도록 작성했기 때문입니다. 이미 익숙한 부분은 빠르게 넘기셔도 됩니다.
 
@@ -92,7 +92,7 @@
 ```
 10-NoteAPI/
 ├── pyproject.toml
-├── uv.lock
+├── uv.lock                # 첫 `uv sync` 시 생성됨 — 저장소에 커밋 권장
 ├── .python-version
 ├── .env.example
 ├── .gitignore
@@ -210,7 +210,7 @@ uv add --dev pytest pytest-asyncio httpx
 |------|------------|------|
 | 웹 | `fastapi` | 본체 프레임워크 |
 | | `uvicorn[standard]` | 개발용 ASGI 서버 |
-| | `gunicorn` | 운영용 프로세스 매니저 |
+| | `gunicorn` | (선택) 운영 프로세스 매니저 — 기본은 Uvicorn 멀티워커 |
 | DB | `sqlalchemy[asyncio]` | ORM (2.x async — `asyncio` extras 가 `greenlet` 까지 함께 깐다) |
 | | `alembic` | 마이그레이션 도구 |
 | | `asyncpg` | PostgreSQL 비동기 드라이버 |
@@ -1965,7 +1965,7 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "4", \
-     "--proxy-headers", "--forwarded-allow-ips=*"]
+     "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]
 ```
 
 각 부분을 풀어 봅니다.
@@ -1979,7 +1979,7 @@ CMD ["uvicorn", "app.main:app", \
 - **`useradd ... app`** + **`USER app`** — 비루트 사용자를 만들고 그 사용자로 실행합니다. 컨테이너 안에서 root로 도는 프로세스는 컨테이너 탈출 취약점이 발견되면 호스트 root와 가까워지므로, 일반 사용자로 두는 게 표준입니다.
 - **`CMD ["uvicorn", ...]`** — 운영용 실행. **Uvicorn 자체 멀티워커 4개 + `--proxy-headers`** 로 띄웁니다. 개발 시에는 docker-compose에서 명령을 `uvicorn --reload` 로 덮어씁니다.
 
-> **왜 Uvicorn 자체 멀티워커?** Uvicorn 0.30(2024-06)부터 자체 워커 매니저가 내장되어, 따로 Gunicorn 을 두지 않아도 N 워커를 띄울 수 있습니다. 옛 패턴인 `gunicorn -k uvicorn.workers.UvicornWorker` 는 deprecated 되어 0.31 에서 별도 패키지(`uvicorn-worker`)로 분리됐습니다. 이 가이드는 단순한 Uvicorn 한 줄을 표준으로 씁니다(09장 배포 가이드 참고).
+> **왜 Uvicorn 자체 멀티워커?** Uvicorn 0.30(2024-06)부터 자체 워커 매니저가 내장되어, 따로 Gunicorn 을 두지 않아도 N 워커를 띄울 수 있습니다. 옛 패턴인 `gunicorn -k uvicorn.workers.UvicornWorker` 는 0.30 부터 deprecated 되어 별도 패키지(`uvicorn-worker`)로 분리됐습니다. 이 가이드는 단순한 Uvicorn 한 줄을 표준으로 씁니다(09장 배포 가이드 참고).
 
 > **워커 수는 어떻게 정하나?** 비동기 앱은 한 워커로도 동시 처리량이 크므로 보통 **CPU 코어 수** 정도가 출발점입니다. 1코어 환경이면 1~2, 2코어면 2~4. 위 Dockerfile 은 4로 박아두었지만, 실제 배포 시 CPU 환경과 메모리 사용량을 보며 조정하세요.
 
@@ -2061,7 +2061,7 @@ services:
              uvicorn app.main:app \
                --host 0.0.0.0 --port 8000 \
                --workers 4 \
-               --proxy-headers --forwarded-allow-ips='*'"
+               --proxy-headers --forwarded-allow-ips='127.0.0.1'"
 
 volumes:
   postgres-data:
@@ -2256,7 +2256,7 @@ docker compose down -v
 - [ ] `app/routers/notes.py` (CRUD, **본인 소유 강제, 타인 메모 → 404**)
 - [ ] `app/main.py` (앱 + CORS + /health + 라우터 include)
 - [ ] `tests/conftest.py` + `tests/test_notes.py` → `uv run pytest`
-- [ ] `Dockerfile` (멀티 스테이지 + 비루트 + Gunicorn)
+- [ ] `Dockerfile` (멀티 스테이지 + 비루트 + Uvicorn 멀티워커)
 - [ ] `docker-compose.yml`에 `app` 서비스 추가 → `docker compose up --build`
 - [ ] `/health`가 200, 회원가입→로그인→메모 CRUD가 모두 통과
 - [ ] (선택) Fly.io 또는 Render로 한 번 배포
@@ -2266,7 +2266,7 @@ docker compose down -v
 ## 10.24 이 챕터 요약
 
 - 이 챕터 한 문서만 따라하면 백지에서 **회원가입 + 로그인 + 개인 메모 CRUD**가 동작하는 작은 백엔드를 완성한다.
-- 도구는 모두 본 가이드의 약속대로: **Python 3.13 / FastAPI 0.115+ / Pydantic 2 / SQLAlchemy 2 (async) + Alembic / PyJWT / bcrypt 직접 사용 / PostgreSQL + Docker Compose / Uvicorn(개발) + Gunicorn(운영) / uv**.
+- 도구는 모두 본 가이드의 약속대로: **Python 3.13 / FastAPI 0.115+ / Pydantic 2 / SQLAlchemy 2 (async) + Alembic / PyJWT / bcrypt 직접 사용 / PostgreSQL + Docker Compose / Uvicorn 자체 멀티워커(운영) / Gunicorn(선택) / uv**.
 - 인증은 **JWT 한 가지**. 비밀번호는 **Bcrypt**로 해싱하고, 72바이트 함정을 사전 검증으로 막는다.
 - 메모 라우트의 **본인 소유 검사**는 쿼리에 `WHERE user_id == current_user.id`를 박아 구조적으로 강제하고, 타인 메모 접근은 **404로 응답**해 정보 누설을 막는다.
 - 페이지네이션(`skip`/`limit`), 태그 필터, 키워드 검색(`ILIKE`)을 한 라우트에서 함께 처리한다.
